@@ -4,42 +4,14 @@ import fs from "fs";
 import https from "https";
 import path from "path";
 import url from "url";
-import {
-  createGame,
-  createScenario,
-  deleteGame,
-  deleteScenario,
-  ensureGameStore,
-  ensureScenarioStore,
-  exportScenarioBundle,
-  getGameCatalog,
-  getGameDetails,
-  getLibraryCatalog,
-  getScenarioCatalog,
-  getScenarioDetails,
-  importScenarioBundle,
-  readRuntimeJsonAsset,
-  removeGameAsset,
-  removeScenarioAsset,
-  resolveGameUploadAsset,
-  resolveScenarioUploadAsset,
-  resolveRuntimeBinaryAsset,
-  setActiveGame,
-  setSelectedScenario,
-  updateGame,
-  updateScenario,
-  uploadGameAsset,
-  uploadScenarioAsset,
-  writeRuntimeJsonAsset,
-} from "./libraryStore.js";
-import {
-  createMapEditorDocument,
-  deleteMapEditorDocument,
-  ensureMapEditorStore,
-  getMapEditorCatalog,
-  getMapEditorDocument,
-  updateMapEditorDocument,
-} from "./mapEditorStore.js";
+import { revealKey } from "./aiKeys.js";
+import { requireAuth } from "./middleware/requireAuth.js";
+import { ensureGameStore, ensureScenarioStore } from "./libraryStore.js";
+import { ensureMapEditorStore } from "./mapEditorStore.js";
+import accountRouter from "./routes/account.js";
+import authRouter from "./routes/auth.js";
+import libraryRouter from "./routes/library.js";
+import mapeditorRouter from "./routes/mapeditor.js";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const app = express();
@@ -48,72 +20,47 @@ const distDir = path.join(__dirname, "../dist");
 
 const jsonParser = express.json({ limit: "64mb" });
 const largeJsonParser = express.json({ limit: "2048mb" });
-const uploadParser = express.raw({ type: () => true, limit: "2048mb" });
 
 // The Android app's connect screen lives on the WebView's own origin, so its
 // probe of this server is a cross-origin request — without these headers the
-// phone blocks it (CORS) and the app can never connect. This is a personal
-// game server whose whole API is open to whoever can reach it, so a blanket
-// allow changes nothing security-wise.
-app.use((req, res, next) => {
+// phone blocks it (CORS) and the app can never connect. Now that the rest of
+// the API sits behind session cookies (which "Access-Control-Allow-Origin: *"
+// cannot legally carry), the blanket allow is scoped to just this public,
+// unauthenticated probe endpoint instead of the whole app.
+const setHealthCorsHeaders = (res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   // Chrome's Private Network Access preflights loopback/LAN targets and
   // requires this opt-in on top of regular CORS.
   res.setHeader("Access-Control-Allow-Private-Network", "true");
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
-  next();
+};
+
+app.get("/api/health", (_req, res) => {
+  setHealthCorsHeaders(res);
+  res.json({ ok: true });
+});
+
+// Chrome's Private Network Access sends an OPTIONS preflight (even for plain
+// GET) before the actual request above. Without a matching route here, that
+// preflight falls through to the library router's requireAuth and gets a 401
+// with no CORS headers, so the browser blocks the real GET — defeating the
+// whole point of the health endpoint.
+app.options("/api/health", (_req, res) => {
+  setHealthCorsHeaders(res);
+  res.status(204).end();
 });
 
 ensureScenarioStore();
 ensureGameStore();
 ensureMapEditorStore();
 
+app.use("/api/auth", authRouter);
+app.use("/api/account", accountRouter);
+
 const sendError = (res, statusCode, error) => {
   const message = error instanceof Error ? error.message : String(error);
   res.status(statusCode).json({ error: message });
-};
-
-const streamBinaryFile = (req, res, sourcePath, contentType = "application/octet-stream") => {
-  const stats = fs.statSync(sourcePath);
-  const totalSize = stats.size;
-  const rangeHeader = req.headers.range;
-
-  res.setHeader("Accept-Ranges", "bytes");
-  res.setHeader("Content-Type", contentType);
-  res.setHeader("Cache-Control", "no-store");
-
-  if (!rangeHeader) {
-    res.setHeader("Content-Length", totalSize);
-    fs.createReadStream(sourcePath).pipe(res);
-    return;
-  }
-
-  const match = /bytes=(\d*)-(\d*)/i.exec(rangeHeader);
-  if (!match) {
-    res.status(416).end();
-    return;
-  }
-
-  const start = match[1] ? Number.parseInt(match[1], 10) : 0;
-  const end = match[2] ? Number.parseInt(match[2], 10) : totalSize - 1;
-  const clampedStart = Number.isFinite(start) ? Math.max(0, Math.min(start, totalSize - 1)) : 0;
-  const clampedEnd = Number.isFinite(end)
-    ? Math.max(clampedStart, Math.min(end, totalSize - 1))
-    : totalSize - 1;
-
-  if (clampedStart >= totalSize || clampedEnd >= totalSize) {
-    res.status(416).setHeader("Content-Range", `bytes */${totalSize}`).end();
-    return;
-  }
-
-  res.status(206);
-  res.setHeader("Content-Length", clampedEnd - clampedStart + 1);
-  res.setHeader("Content-Range", `bytes ${clampedStart}-${clampedEnd}/${totalSize}`);
-  fs.createReadStream(sourcePath, { end: clampedEnd, start: clampedStart }).pipe(res);
 };
 
 // Global client preferences (currently the UI language) shared by every
@@ -208,250 +155,6 @@ app.put("/api/ui-settings", jsonParser, (req, res) => {
   }
 });
 
-app.get("/api/scenarios", (_req, res) => {
-  try {
-    res.json(getScenarioCatalog());
-  } catch (error) {
-    sendError(res, 500, error);
-  }
-});
-
-app.get("/api/library", (_req, res) => {
-  try {
-    res.json(getLibraryCatalog());
-  } catch (error) {
-    sendError(res, 500, error);
-  }
-});
-
-app.get("/api/scenarios/:scenarioId", (req, res) => {
-  try {
-    res.json(getScenarioDetails(req.params.scenarioId));
-  } catch (error) {
-    sendError(res, 404, error);
-  }
-});
-
-app.post("/api/scenarios", jsonParser, (req, res) => {
-  try {
-    res.status(201).json(createScenario(req.body ?? {}));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.put("/api/scenarios/active", jsonParser, (req, res) => {
-  try {
-    res.json(setSelectedScenario(req.body?.scenarioId));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.put("/api/scenarios/selected", jsonParser, (req, res) => {
-  try {
-    res.json(setSelectedScenario(req.body?.scenarioId));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.put("/api/scenarios/:scenarioId", jsonParser, (req, res) => {
-  try {
-    res.json(updateScenario(req.params.scenarioId, req.body ?? {}));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.get("/api/scenarios/:scenarioId/export", (req, res) => {
-  try {
-    const mode = req.query?.mode === "full" ? "full" : "light";
-    res.json(exportScenarioBundle(req.params.scenarioId, { mode }));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.post("/api/scenarios/import", largeJsonParser, (req, res) => {
-  try {
-    res.status(201).json(importScenarioBundle(req.body ?? {}, { setSelected: true }));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.get("/api/scenarios/:scenarioId/assets/:assetKey", (req, res) => {
-  try {
-    const asset = resolveScenarioUploadAsset(req.params.scenarioId, req.params.assetKey);
-    streamBinaryFile(req, res, asset.sourcePath, asset.contentType);
-  } catch (error) {
-    sendError(res, 404, error);
-  }
-});
-
-app.put("/api/scenarios/:scenarioId/assets/:assetKey", uploadParser, (req, res) => {
-  try {
-    const buffer = Buffer.isBuffer(req.body)
-      ? req.body
-      : Buffer.from(req.body ?? "");
-    res.json(
-      uploadScenarioAsset(
-        req.params.scenarioId,
-        req.params.assetKey,
-        buffer,
-        req.headers["content-type"],
-      ),
-    );
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.get("/api/games", (_req, res) => {
-  try {
-    res.json(getGameCatalog());
-  } catch (error) {
-    sendError(res, 500, error);
-  }
-});
-
-app.get("/api/games/:gameId", (req, res) => {
-  try {
-    res.json(getGameDetails(req.params.gameId));
-  } catch (error) {
-    sendError(res, 404, error);
-  }
-});
-
-app.post("/api/games", jsonParser, (req, res) => {
-  try {
-    res.status(201).json(createGame(req.body ?? {}));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.put("/api/games/active", jsonParser, (req, res) => {
-  try {
-    res.json(setActiveGame(req.body?.gameId));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.put("/api/games/:gameId", jsonParser, (req, res) => {
-  try {
-    res.json(updateGame(req.params.gameId, req.body ?? {}));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.get("/api/games/:gameId/assets/:assetKey", (req, res) => {
-  try {
-    const asset = resolveGameUploadAsset(req.params.gameId, req.params.assetKey);
-    streamBinaryFile(req, res, asset.sourcePath, asset.contentType);
-  } catch (error) {
-    sendError(res, 404, error);
-  }
-});
-
-app.put("/api/games/:gameId/assets/:assetKey", uploadParser, (req, res) => {
-  try {
-    const buffer = Buffer.isBuffer(req.body)
-      ? req.body
-      : Buffer.from(req.body ?? "");
-    res.json(
-      uploadGameAsset(
-        req.params.gameId,
-        req.params.assetKey,
-        buffer,
-        req.headers["content-type"],
-      ),
-    );
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.delete("/api/games/:gameId", (req, res) => {
-  try {
-    res.json(deleteGame(req.params.gameId));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.delete("/api/games/:gameId/assets/:assetKey", (req, res) => {
-  try {
-    res.json(removeGameAsset(req.params.gameId, req.params.assetKey));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.delete("/api/scenarios/:scenarioId/assets/:assetKey", (req, res) => {
-  try {
-    res.json(removeScenarioAsset(req.params.scenarioId, req.params.assetKey));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.delete("/api/scenarios/:scenarioId", (req, res) => {
-  try {
-    res.json(deleteScenario(req.params.scenarioId));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.get("/api/runtime/json/:assetKey", (req, res) => {
-  try {
-    const asset = readRuntimeJsonAsset(req.params.assetKey);
-    res.setHeader("Cache-Control", "no-store");
-    res.type("application/json");
-    res.send(JSON.stringify(asset.data));
-  } catch (error) {
-    sendError(res, 404, error);
-  }
-});
-
-app.put("/api/runtime/json/:assetKey", jsonParser, (req, res) => {
-  try {
-    const asset = writeRuntimeJsonAsset(req.params.assetKey, req.body ?? {});
-    res.setHeader("Cache-Control", "no-store");
-    res.type("application/json");
-    res.send(JSON.stringify(asset.data));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.get("/api/runtime/pmtiles/:assetKey", (req, res) => {
-  try {
-    const asset = resolveRuntimeBinaryAsset(req.params.assetKey);
-    streamBinaryFile(req, res, asset.sourcePath, asset.contentType);
-  } catch (error) {
-    sendError(res, 404, error);
-  }
-});
-
-app.head("/api/runtime/pmtiles/:assetKey", (req, res) => {
-  try {
-    const asset = resolveRuntimeBinaryAsset(req.params.assetKey);
-    const stats = fs.statSync(asset.sourcePath);
-    res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Content-Type", asset.contentType);
-    res.setHeader("Content-Length", stats.size);
-    res.setHeader("Cache-Control", "no-store");
-    res.status(200).end();
-  } catch (error) {
-    sendError(res, 404, error);
-  }
-});
-
 // ---- Scenario Hub --------------------------------------------------------
 // Downloads a scenario bundle from the community hub on the browser's behalf —
 // GitHub file attachments don't send CORS headers, so the client can't fetch
@@ -471,16 +174,56 @@ const HUB_MAX_BUNDLE_BYTES = 200 * 1024 * 1024;
 // plain server-to-server for the endpoint. The target is whatever the player
 // configured in Settings — them talking to their own AI through their own
 // game server.
-app.post("/api/ai/relay", largeJsonParser, async (req, res) => {
+//
+// When the client identifies the call as one of its own account-linked
+// providers (authProvider), the server looks up that provider's encrypted
+// key itself and injects the auth header — the plaintext key never has to
+// pass through (or be stored in) the browser for these relayed providers.
+// Any client-supplied Authorization/x-api-key header is discarded first so
+// it can't be used to smuggle a different credential through.
+const RELAY_AUTH_PROVIDERS = ["openai", "openai-compatible", "anthropic"];
+
+app.post("/api/ai/relay", requireAuth, largeJsonParser, async (req, res) => {
   try {
-    const { url: targetUrl, method = "POST", headers = {}, payload } = req.body ?? {};
+    const { url: targetUrl, method = "POST", headers = {}, payload, authProvider } = req.body ?? {};
     const target = new URL(String(targetUrl ?? ""));
     if (target.protocol !== "http:" && target.protocol !== "https:") {
       return sendError(res, 400, new Error("Only http(s) AI endpoints can be relayed."));
     }
+
+    const forwardHeaders = { "Content-Type": "application/json", ...headers };
+
+    if (authProvider) {
+      if (!RELAY_AUTH_PROVIDERS.includes(authProvider)) {
+        return sendError(res, 400, new Error(`Unknown authProvider: ${authProvider}`));
+      }
+      // api.openai.com.evil.com is a different host — only the exact host
+      // may receive the OpenAI key.
+      if (authProvider === "openai" && target.hostname !== "api.openai.com") {
+        return sendError(res, 400, new Error('authProvider "openai" may only target api.openai.com.'));
+      }
+
+      const key = revealKey(req.user.id, authProvider);
+      if (!key) {
+        return sendError(res, 400, new Error(`No API key saved for provider: ${authProvider}`));
+      }
+
+      for (const name of Object.keys(forwardHeaders)) {
+        if (name.toLowerCase() === "authorization" || name.toLowerCase() === "x-api-key") {
+          delete forwardHeaders[name];
+        }
+      }
+
+      if (authProvider === "anthropic") {
+        forwardHeaders["x-api-key"] = key;
+      } else {
+        forwardHeaders.Authorization = `Bearer ${key}`;
+      }
+    }
+
     const upstream = await fetch(target, {
       method: method === "GET" ? "GET" : "POST",
-      headers: { "Content-Type": "application/json", ...headers },
+      headers: forwardHeaders,
       body: method === "GET" ? undefined : JSON.stringify(payload ?? {}),
     });
     const text = await upstream.text();
@@ -495,7 +238,7 @@ app.post("/api/ai/relay", largeJsonParser, async (req, res) => {
 // Shut the server down from the UI (the ⏻ button in the top bar) — handy on
 // phones/Termux and headless installs where no terminal is in sight. Responds
 // first so the client can show its "server stopped" screen, then exits.
-app.post("/api/server/shutdown", (_req, res) => {
+app.post("/api/server/shutdown", requireAuth, (_req, res) => {
   res.json({ ok: true });
   console.log("Shutdown requested from the UI — exiting.");
   setTimeout(() => process.exit(0), 300);
@@ -526,46 +269,23 @@ app.get("/api/hub/file", async (req, res) => {
   }
 });
 
-// ---- Map editor documents ------------------------------------------------
-app.get("/api/mapeditor/documents", (_req, res) => {
-  try {
-    res.json(getMapEditorCatalog());
-  } catch (error) {
-    sendError(res, 500, error);
-  }
-});
+// Scenario/game library CRUD + runtime asset routes (routes/library.js) and
+// map editor document CRUD (routes/mapeditor.js) — both require auth and
+// filter by ownerId/shared internally via an unscoped `router.use(requireAuth)`.
+// Their routes hard-code full "/api/..." paths, so they must be mounted at
+// "/" — but mounted unguarded, that blanket requireAuth would intercept
+// *every* request reaching this point, including the SPA shell and its
+// static assets below, and 401 them before they ever render a login screen.
+// Every other route this server exposes is registered above and already
+// resolves the request before falling through, so by now the only remaining
+// candidates are genuine unmatched /api/* calls (must go through requireAuth)
+// or SPA/static paths (must not) — gate explicitly on that instead of
+// relying on registration order alone.
+const requireApiPrefix = (router) => (req, res, next) =>
+  req.path.startsWith("/api/") ? router(req, res, next) : next();
 
-app.post("/api/mapeditor/documents", largeJsonParser, (req, res) => {
-  try {
-    res.status(201).json(createMapEditorDocument(req.body ?? {}));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.get("/api/mapeditor/documents/:id", (req, res) => {
-  try {
-    res.json(getMapEditorDocument(req.params.id));
-  } catch (error) {
-    sendError(res, 404, error);
-  }
-});
-
-app.put("/api/mapeditor/documents/:id", largeJsonParser, (req, res) => {
-  try {
-    res.json(updateMapEditorDocument(req.params.id, req.body ?? {}));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
-
-app.delete("/api/mapeditor/documents/:id", (req, res) => {
-  try {
-    res.json(deleteMapEditorDocument(req.params.id));
-  } catch (error) {
-    sendError(res, 400, error);
-  }
-});
+app.use(requireApiPrefix(libraryRouter));
+app.use(requireApiPrefix(mapeditorRouter));
 
 app.use(express.static(distDir));
 
