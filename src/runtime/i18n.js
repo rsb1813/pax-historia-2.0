@@ -1,8 +1,11 @@
 /*! Open Historia — language setting & top-50 language catalog © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+import { getAccountSettings, patchAccountSettings } from "./accountSettings.js";
 
-// UI language: chosen in Settings, stored on the SERVER (shared by every
-// device that plays through it — desktop browser and the Android app see the
-// same choice) and mirrored in localStorage so boot doesn't wait on a fetch.
+// UI language: chosen in Settings, stored per-ACCOUNT on the server (via
+// runtime/accountSettings.js — shared by every device signed into that
+// account) and mirrored in localStorage so boot doesn't wait on a fetch. That
+// mirror is also what the pre-login translator boot (startTranslator(), see
+// main.jsx) reads, since no account is loaded yet at that point.
 // "en" (the authored language) means no translation work happens at all.
 const STORAGE_KEY = "ui_language";
 export const DEFAULT_LANGUAGE = "en";
@@ -69,6 +72,9 @@ export const getLanguageOptions = () => LANGUAGES;
 export const languageDisplayName = (code) =>
   LANGUAGES.find((entry) => entry.code === code)?.name || code;
 
+// Always reads the local mirror — this is what the pre-login translator boot
+// (startTranslator(), no account loaded yet) sees, and it's kept in sync with
+// the account by setStoredLanguage()/syncLanguageFromServer() below.
 export const getStoredLanguage = () => {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -90,41 +96,27 @@ const writeLocalLanguage = (code) => {
   }
 };
 
-// Persist locally AND on the server, so the choice follows the player to
-// every device connected to this server (the Android app included).
+// Persist locally AND on the account, so the choice follows the player to
+// every device signed into that account.
 export const setStoredLanguage = async (code) => {
   writeLocalLanguage(code);
-  try {
-    await fetch("/api/ui-settings", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ language: code || DEFAULT_LANGUAGE }),
-    });
-  } catch {
-    // Offline/hub-hosted: the local copy still applies on this device.
-  }
+  patchAccountSettings({ language: code || DEFAULT_LANGUAGE });
 };
 
-// Boot-time reconcile: the server's choice wins. Returns true when the local
-// value changed (caller reloads so the translator restarts cleanly).
+// Called by AuthGate right after loadAccountSettings() resolves (i.e. once
+// the account's real language is known for the first time this boot).
+// Reconciles it against the local mirror the pre-login translator booted
+// with; returns true when they disagreed, so the caller can reload and let
+// the translator reboot cleanly with the correct language already mirrored.
 export const syncLanguageFromServer = async () => {
-  try {
-    const response = await fetch("/api/ui-settings");
-    if (!response.ok) {
-      return false;
-    }
+  const accountLanguage = getAccountSettings()?.language;
+  const serverLanguage = typeof accountLanguage === "string" && accountLanguage.trim()
+    ? accountLanguage.trim()
+    : DEFAULT_LANGUAGE;
 
-    const settings = await response.json();
-    const serverLanguage = typeof settings?.language === "string" && settings.language.trim()
-      ? settings.language.trim()
-      : DEFAULT_LANGUAGE;
-
-    if (serverLanguage !== getStoredLanguage()) {
-      writeLocalLanguage(serverLanguage);
-      return true;
-    }
-  } catch {
-    // Server unreachable: keep the local value.
+  if (serverLanguage !== getStoredLanguage()) {
+    writeLocalLanguage(serverLanguage);
+    return true;
   }
 
   return false;

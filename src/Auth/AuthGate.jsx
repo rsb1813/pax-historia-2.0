@@ -2,6 +2,8 @@
 import { useEffect, useState } from "react";
 import { getSessionState } from "../runtime/auth.js";
 import { loadAccountSettings, loadAiKeyStatus } from "../runtime/accountSettings.js";
+import { syncLanguageFromServer } from "../runtime/i18n.js";
+import { importLegacyLocalStorage } from "./legacyImport.js";
 import SetupScreen from "./SetupScreen.jsx";
 import LoginScreen from "./LoginScreen.jsx";
 
@@ -56,13 +58,34 @@ const AuthGate = ({ children }) => {
         // Fail-open: a settings-load hiccup should never strand an already
         // logged-in player behind an infinite loading screen — the caches
         // just fall back to their built-in defaults.
-        Promise.all([loadAccountSettings(), loadAiKeyStatus()])
-            .catch((err) => {
+        (async () => {
+            try {
+                await loadAccountSettings();
+
+                // Must run before the language sync below: it may read (and
+                // then clear) this browser's legacy "ui_language" key, which
+                // the sync would otherwise treat as this device's language
+                // mirror and overwrite first.
+                await importLegacyLocalStorage();
+
+                // The pre-login translator boots from the local language
+                // mirror only (no account was loaded yet). Now that the
+                // account's real language is known, reconcile the two and
+                // reload so the translator restarts cleanly if they disagreed
+                // — skip settingsReady in that case, so children never flash
+                // in the wrong language right before the reload lands.
+                if (await syncLanguageFromServer()) {
+                    window.location.reload();
+                    return;
+                }
+
+                await loadAiKeyStatus();
+            } catch (err) {
                 console.error("Failed to load account settings:", err);
-            })
-            .finally(() => {
-                if (!cancelled) setSettingsReady(true);
-            });
+            }
+
+            if (!cancelled) setSettingsReady(true);
+        })();
 
         return () => {
             cancelled = true;

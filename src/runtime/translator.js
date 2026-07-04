@@ -19,7 +19,6 @@ import {
   getStoredLanguage,
   isRtlLanguage,
   languageDisplayName,
-  syncLanguageFromServer,
 } from "./i18n.js";
 
 const CACHE_PREFIX = "i18n_cache_";
@@ -589,15 +588,11 @@ export const startTranslator = () => {
     return;
   }
 
-  // The server's stored choice wins over this device's copy, so a language
-  // picked on desktop applies in the Android app (and vice versa). Runs even
-  // when this device thinks it's English — a fresh install has no local copy.
-  void syncLanguageFromServer().then((changed) => {
-    if (changed) {
-      window.location.reload();
-    }
-  });
-
+  // No account is loaded yet at this point (this runs before login — see
+  // main.jsx), so this boots from the local language mirror only. AuthGate
+  // reconciles that mirror against the real account language right after
+  // login (runtime/i18n.js's syncLanguageFromServer()) and reloads if they
+  // disagreed, letting the translator reboot cleanly with the right one.
   language = getStoredLanguage();
   if (language === DEFAULT_LANGUAGE) {
     return;

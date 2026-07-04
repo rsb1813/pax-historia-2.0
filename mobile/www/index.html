@@ -118,7 +118,7 @@
         const native = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.CapacitorHttp;
         if (native) {
           const res = await native.request({
-            url: url + "/api/library",
+            url: url + "/api/health",
             method: "GET",
             connectTimeout: 4000,
             readTimeout: 4000,
@@ -128,7 +128,7 @@
           }
           return;
         }
-        await fetch(url + "/api/library", { signal: AbortSignal.timeout(4000) });
+        await fetch(url + "/api/health", { signal: AbortSignal.timeout(4000) });
       };
 
       // Probe the server first so a typo shows an error here instead of a
