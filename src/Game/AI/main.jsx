@@ -6,6 +6,7 @@ import {
     providerSupportsModelDiscovery,
     setProviderField,
 } from "./providerConfig.js";
+import { hasProviderApiKey, revealProviderApiKey } from "../../runtime/accountSettings.js";
 import { JSON_URLS, readJson } from "../../runtime/assets.js";
 import { languageDirective } from "../../runtime/i18n.js";
 import { difficultyDirective } from "../../runtime/difficulty.js";
@@ -171,12 +172,18 @@ function getGeminiUrl(model, apiKey) {
 // the endpoint: self-hosted endpoints (llama.cpp, LM Studio, NVIDIA NIM...)
 // rarely send CORS headers, so the browser can't call them directly. The relay
 // is same-origin for us and plain server-to-server for the endpoint. Gemini and
-// Anthropic stay direct — both support browser calls explicitly.
-const relayFetch = (url, { method = "POST", headers = {}, payload } = {}) =>
+// default-endpoint Anthropic stay direct — both support browser calls
+// explicitly.
+//
+// authProvider identifies the call as one of the account's own encrypted keys
+// (openai/openai-compatible/anthropic) — the server looks the key up itself and
+// injects the auth header, so the plaintext key never has to pass through (or
+// be stored in) the browser for these relayed providers.
+const relayFetch = (url, { method = "POST", headers = {}, payload, authProvider } = {}) =>
     fetch("/api/ai/relay", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, method, headers, payload }),
+        body: JSON.stringify({ url, method, headers, payload, authProvider }),
     });
 
 function toOpenAIMessages(systemPrompt, history) {
@@ -202,7 +209,7 @@ function toAnthropicMessages(history) {
     }));
 }
 
-async function resolveModel(provider, { endpoint = "", headers = {}, fallbackModel = "", providerLabel } = {}) {
+async function resolveModel(provider, { endpoint = "", authProvider = null, fallbackModel = "", providerLabel } = {}) {
     const settings = getProviderSettings(provider);
     const configuredModel = settings.model.trim();
 
@@ -225,7 +232,7 @@ async function resolveModel(provider, { endpoint = "", headers = {}, fallbackMod
     }
 
     try {
-        const response = await relayFetch(`${normalizedEndpoint}/models`, { method: "GET", headers });
+        const response = await relayFetch(`${normalizedEndpoint}/models`, { method: "GET", authProvider });
 
         if (!response.ok) {
             const payload = await readErrorPayload(response);
@@ -249,13 +256,13 @@ async function resolveModel(provider, { endpoint = "", headers = {}, fallbackMod
 }
 
 async function callGemini(systemPrompt, history, { retries = 3, retryDelay = 15000 } = {}) {
-    const settings = getProviderSettings("gemini");
-    const apiKey = settings.apiKey.trim();
+    const apiKey = await revealProviderApiKey("gemini");
 
     if (!apiKey) {
         throw new Error("Go to **settings** and paste your Gemini API key - you can get it at https://aistudio.google.com/app/apikey");
     }
 
+    const settings = getProviderSettings("gemini");
     const model = await resolveModel("gemini", {
         fallbackModel: GEMINI_DEFAULT_MODEL,
         providerLabel: "Gemini",
@@ -312,7 +319,7 @@ async function callGemini(systemPrompt, history, { retries = 3, retryDelay = 150
 
 async function callOpenAIStyleChatCompletions({
     endpoint,
-    headers,
+    authProvider,
     model,
     systemPrompt,
     history,
@@ -323,7 +330,7 @@ async function callOpenAIStyleChatCompletions({
 }) {
     for (let attempt = 1; attempt <= retries; attempt++) {
         const response = await relayFetch(`${normalizeEndpoint(endpoint)}/chat/completions`, {
-            headers,
+            authProvider,
             payload: {
                 model,
                 messages: toOpenAIMessages(systemPrompt, history),
@@ -363,27 +370,21 @@ async function callOpenAIStyleChatCompletions({
 }
 
 async function callOpenAI(systemPrompt, history, opts = {}) {
-    const settings = getProviderSettings("openai");
-    const apiKey = settings.apiKey.trim();
-
-    if (!apiKey) {
+    if (!hasProviderApiKey("openai")) {
         throw new Error("Go to **settings** and paste your OpenAI API key.");
     }
 
-    const headers = {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-    };
+    const settings = getProviderSettings("openai");
 
     const model = await resolveModel("openai", {
         endpoint: OPENAI_API_ENDPOINT,
-        headers,
+        authProvider: "openai",
         providerLabel: "OpenAI",
     });
 
     return callOpenAIStyleChatCompletions({
         endpoint: OPENAI_API_ENDPOINT,
-        headers,
+        authProvider: "openai",
         model,
         systemPrompt,
         history,
@@ -401,20 +402,19 @@ async function callOpenAICompatible(systemPrompt, history, opts = {}) {
         throw new Error("Go to **settings**, select OpenAI Compatible, and enter your endpoint (for example http://localhost:11434/v1).");
     }
 
-    const headers = {
-        "Content-Type": "application/json",
-        ...(settings.apiKey.trim() ? { Authorization: `Bearer ${settings.apiKey.trim()}` } : {}),
-    };
+    // Self-hosted gateways (local Ollama etc.) commonly need no key at all —
+    // only ask the relay to inject one when the account actually has one saved.
+    const authProvider = hasProviderApiKey("openai-compatible") ? "openai-compatible" : null;
 
     const model = await resolveModel("openai-compatible", {
         endpoint,
-        headers,
+        authProvider,
         providerLabel: "OpenAI Compatible",
     });
 
     return callOpenAIStyleChatCompletions({
         endpoint,
-        headers,
+        authProvider,
         model,
         systemPrompt,
         history,
@@ -425,12 +425,11 @@ async function callOpenAICompatible(systemPrompt, history, opts = {}) {
 }
 
 async function callAnthropic(systemPrompt, history, { retries = 3, retryDelay = 15000 } = {}) {
-    const settings = getProviderSettings("anthropic");
-    const apiKey = settings.apiKey.trim();
-
-    if (!apiKey) {
+    if (!hasProviderApiKey("anthropic")) {
         throw new Error("Go to **settings** and paste your Anthropic API key.");
     }
+
+    const settings = getProviderSettings("anthropic");
 
     const model = await resolveModel("anthropic", {
         fallbackModel: ANTHROPIC_DEFAULT_MODEL,
@@ -439,20 +438,12 @@ async function callAnthropic(systemPrompt, history, { retries = 3, retryDelay = 
 
     // A custom endpoint is a self-hosted proxy — it can't be assumed to send the
     // CORS headers the real API does, so it goes through the relay like
-    // OpenAI-compatible endpoints do. The default (blank) endpoint keeps calling
-    // the real API directly, unchanged from before.
+    // OpenAI-compatible endpoints do (server injects the key, plaintext never
+    // reaches the browser). The default (blank) endpoint keeps calling the real
+    // API directly, which needs the plaintext key revealed to the browser.
     const customEndpoint = normalizeEndpoint(settings.endpoint);
     const usingCustomEndpoint = Boolean(customEndpoint);
     const endpoint = customEndpoint || ANTHROPIC_API_ENDPOINT;
-
-    const headers = {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        // Only the real API needs/accepts this browser-safety opt-in; a
-        // self-hosted proxy is called server-to-server via the relay instead.
-        ...(usingCustomEndpoint ? {} : { "anthropic-dangerous-direct-browser-access": "true" }),
-    };
 
     // Reasoning toggle (settings): extended thinking. max_tokens must exceed the
     // thinking budget, so it is raised alongside; thinking blocks are filtered out
@@ -470,8 +461,23 @@ async function callAnthropic(systemPrompt, history, { retries = 3, retryDelay = 
             ...customParams,
         };
         const response = usingCustomEndpoint
-            ? await relayFetch(`${endpoint}/messages`, { headers, payload: body })
-            : await fetch(`${endpoint}/messages`, { method: "POST", headers, body: JSON.stringify(body) });
+            ? await relayFetch(`${endpoint}/messages`, {
+                authProvider: "anthropic",
+                headers: { "anthropic-version": "2023-06-01" },
+                payload: body,
+            })
+            : await fetch(`${endpoint}/messages`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "x-api-key": await revealProviderApiKey("anthropic"),
+                    "anthropic-version": "2023-06-01",
+                    // Only the real API needs/accepts this browser-safety opt-in; a
+                    // self-hosted proxy is called server-to-server via the relay instead.
+                    "anthropic-dangerous-direct-browser-access": "true",
+                },
+                body: JSON.stringify(body),
+            });
 
         if (response.status === 429 || response.status === 503) {
             if (attempt === retries) {

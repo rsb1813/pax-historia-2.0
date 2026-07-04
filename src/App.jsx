@@ -12,6 +12,7 @@ import {
   runStartupPreload,
 } from "./runtime/preload.js";
 import { ensureLibraryCatalog, useLibraryState } from "./runtime/library.js";
+import { MAP_SETTING_KEYS, setMapSetting, useMapSetting } from "./runtime/mapSettings.js";
 
 const WorldShell = {
   backgroundColor: "#000",
@@ -40,23 +41,9 @@ function GameApp() {
   const [startupState, setStartupState] = useState(createInitialStartupState);
   const [isReady, setIsReady] = useState(false);
   const [hasFirstWorldIdle, setHasFirstWorldIdle] = useState(false);
-  const [isGlobeEnabled, setIsGlobeEnabled] = useState(() => {
-    const saved = localStorage.getItem("Globe");
-    return saved !== null ? JSON.parse(saved) : false;
-  });
-  const [isTerrainEnabled, setIsTerrainEnabled] = useState(() => {
-    const saved = localStorage.getItem("Terrain");
-    return saved !== null ? JSON.parse(saved) : true;
-  });
+  const isGlobeEnabled = useMapSetting(MAP_SETTING_KEYS.globeProjection);
+  const isTerrainEnabled = useMapSetting(MAP_SETTING_KEYS.terrainEnabled);
   const { token: libraryToken } = useLibraryState();
-
-  useEffect(() => {
-    localStorage.setItem("Globe", JSON.stringify(isGlobeEnabled));
-  }, [isGlobeEnabled]);
-
-  useEffect(() => {
-    localStorage.setItem("Terrain", JSON.stringify(isTerrainEnabled));
-  }, [isTerrainEnabled]);
 
   useEffect(() => {
     preloadStartedAtRef.current = performance.now();
@@ -174,8 +161,8 @@ function GameApp() {
       isGlobeEnabled={isGlobeEnabled}
       isTerrainEnabled={isTerrainEnabled}
       mapRef={mapRef}
-      setIsGlobeEnabled={setIsGlobeEnabled}
-      setIsTerrainEnabled={setIsTerrainEnabled}
+      setIsGlobeEnabled={(value) => setMapSetting(MAP_SETTING_KEYS.globeProjection, value)}
+      setIsTerrainEnabled={(value) => setMapSetting(MAP_SETTING_KEYS.terrainEnabled, value)}
       />
     )}
     {!isReady && <StartupScreen {...startupOverlayState} />}

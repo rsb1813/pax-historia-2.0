@@ -11,8 +11,8 @@ import { ForcesPanel } from "./forces";
 import {
   getStoredProvider,
   loadProviderSettingsFormState,
-  normalizeProvider,
   persistProviderSetting,
+  setStoredProvider,
 } from "../AI/providerConfig.js";
 
 const ADVISOR_PANEL_WIDTH = "min(20rem, calc(100vw - 1rem))";
@@ -206,14 +206,6 @@ const Main = ({
   }, [isAdvisorOpen]);
 
   useEffect(() => {
-    localStorage.setItem("Fullscreen", JSON.stringify(isFullscreenEnabled));
-  }, [isFullscreenEnabled]);
-
-  useEffect(() => {
-    localStorage.setItem("api_provider", normalizeProvider(apiProvider));
-  }, [apiProvider]);
-
-  useEffect(() => {
     if (isSettingsOpen) {
       setApiProvider(getStoredProvider());
       setProviderSettings(loadProviderSettingsFormState());
@@ -223,6 +215,11 @@ const Main = ({
   const handleProviderSettingChange = (key, value) => {
     setProviderSettings((prev) => ({ ...prev, [key]: value }));
     persistProviderSetting(key, value);
+  };
+
+  const handleApiProviderChange = (value) => {
+    setApiProvider(value);
+    setStoredProvider(value);
   };
 
   const toggleFullscreen = (shouldBeFull) => {
@@ -322,7 +319,7 @@ const Main = ({
           onToggleGlobe={() => setIsGlobeEnabled(!isGlobeEnabled)}
           onToggleTerrain={() => setIsTerrainEnabled(!isTerrainEnabled)}
           apiProvider={apiProvider}
-          onApiProviderChange={setApiProvider}
+          onApiProviderChange={handleApiProviderChange}
           providerSettings={providerSettings}
           onProviderSettingChange={handleProviderSettingChange}
         />

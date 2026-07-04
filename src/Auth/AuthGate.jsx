@@ -1,6 +1,7 @@
 // 앱 진입점 게이트 — 세션 조회 후 부트스트랩/로그인/인증완료 화면을 분기한다
 import { useEffect, useState } from "react";
 import { getSessionState } from "../runtime/auth.js";
+import { loadAccountSettings, loadAiKeyStatus } from "../runtime/accountSettings.js";
 import SetupScreen from "./SetupScreen.jsx";
 import LoginScreen from "./LoginScreen.jsx";
 
@@ -22,6 +23,11 @@ const AuthGate = ({ children }) => {
     const [authState, setAuthState] = useState(null);
     const [error, setError] = useState(null);
     const [attempt, setAttempt] = useState(0);
+    // Account settings/AI key status are loaded once right after auth resolves
+    // so every synchronous consumer (useMapSetting, getStoredProvider, ...)
+    // sees a warm cache on children's first render instead of transient
+    // defaults.
+    const [settingsReady, setSettingsReady] = useState(false);
 
     useEffect(() => {
         let cancelled = false;
@@ -40,6 +46,28 @@ const AuthGate = ({ children }) => {
             cancelled = true;
         };
     }, [attempt]);
+
+    useEffect(() => {
+        if (!authState?.authenticated) return;
+
+        let cancelled = false;
+        setSettingsReady(false);
+
+        // Fail-open: a settings-load hiccup should never strand an already
+        // logged-in player behind an infinite loading screen — the caches
+        // just fall back to their built-in defaults.
+        Promise.all([loadAccountSettings(), loadAiKeyStatus()])
+            .catch((err) => {
+                console.error("Failed to load account settings:", err);
+            })
+            .finally(() => {
+                if (!cancelled) setSettingsReady(true);
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [authState]);
 
     // Login/Setup call this after a successful login/register. Rather than
     // trusting their response, re-run the same /api/auth/session check this
@@ -65,6 +93,10 @@ const AuthGate = ({ children }) => {
 
     if (!authState.authenticated) {
         return <LoginScreen onAuthenticated={handleAuthenticated} />;
+    }
+
+    if (!settingsReady) {
+        return <div style={loadingShellStyle}>Loading…</div>;
     }
 
     return children;

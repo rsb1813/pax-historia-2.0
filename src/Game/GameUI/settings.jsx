@@ -8,6 +8,7 @@ import {
     providerSupportsModelDiscovery,
     setReasoningEnabled,
 } from "../AI/providerConfig.js";
+import { hasProviderApiKey, setProviderApiKey } from "../../runtime/accountSettings.js";
 import {
     getLanguageOptions,
     getStoredLanguage,
@@ -437,6 +438,55 @@ const SettingsInput = ({
     </div>
 );
 
+// Write-only secret field: the real key lives encrypted on the server and is
+// never fetched back into the DOM. The input only ever holds what the player
+// is currently typing; a saved key shows as a placeholder, not a value.
+const ApiKeyInput = ({ label, provider, placeholder, helperText }) => {
+    const [draft, setDraft] = useState("");
+    const [saved, setSaved] = useState(() => hasProviderApiKey(provider));
+    const [saveError, setSaveError] = useState(false);
+
+    const commit = () => {
+        const trimmed = draft.trim();
+        if (!trimmed) return;
+        setProviderApiKey(provider, trimmed)
+            .then(() => {
+                setSaved(true);
+                setDraft("");
+                setSaveError(false);
+            })
+            .catch((error) => {
+                console.error(`Failed to save ${provider} API key:`, error);
+                setSaveError(true);
+            });
+    };
+
+    return (
+        <div style={fieldGroupStyle}>
+        <label style={labelStyle}>{label}</label>
+        <input
+        type="password"
+        value={draft}
+        onChange={(event) => {
+            setDraft(event.target.value);
+            if (saveError) setSaveError(false);
+        }}
+        onBlur={commit}
+        placeholder={saved ? "Key saved — leave blank to keep, type to replace" : placeholder}
+        autoComplete="off"
+        spellCheck={false}
+        style={inputStyle}
+        />
+        {saveError && (
+            <div style={{ ...helperStyle, color: "#f87171" }}>Failed to save key — try again.</div>
+        )}
+        {!saveError && helperText && (
+            <div style={helperStyle}>{helperText}</div>
+        )}
+        </div>
+    );
+};
+
 const ProviderSettingsPanel = ({ provider, settings, onSettingChange }) => {
     const meta = getProviderMeta(provider);
     const supportsModelDiscovery = providerSupportsModelDiscovery(provider);
@@ -467,13 +517,11 @@ const ProviderSettingsPanel = ({ provider, settings, onSettingChange }) => {
 
         {provider === "gemini" && (
             <>
-            <SettingsInput
+            <ApiKeyInput
             label="Gemini API Key"
-            type="password"
-            value={settings.geminiApiKey ?? ""}
-            onChange={(value) => onSettingChange("geminiApiKey", value)}
+            provider="gemini"
             placeholder="Paste Gemini API key"
-            helperText="Stored only in this browser."
+            helperText="Stored encrypted on the server for this account."
             />
             <SettingsInput
             label="Model"
@@ -495,13 +543,11 @@ const ProviderSettingsPanel = ({ provider, settings, onSettingChange }) => {
 
         {provider === "openai" && (
             <>
-            <SettingsInput
+            <ApiKeyInput
             label="OpenAI API Key"
-            type="password"
-            value={settings.openaiApiKey ?? ""}
-            onChange={(value) => onSettingChange("openaiApiKey", value)}
+            provider="openai"
             placeholder="Paste OpenAI API key"
-            helperText="Stored only in this browser."
+            helperText="Stored encrypted on the server for this account."
             />
             <SettingsInput
             label="Model"
@@ -527,13 +573,11 @@ const ProviderSettingsPanel = ({ provider, settings, onSettingChange }) => {
 
         {provider === "anthropic" && (
             <>
-            <SettingsInput
+            <ApiKeyInput
             label="Anthropic API Key"
-            type="password"
-            value={settings.anthropicApiKey ?? ""}
-            onChange={(value) => onSettingChange("anthropicApiKey", value)}
+            provider="anthropic"
             placeholder="Paste Anthropic API key"
-            helperText="Stored only in this browser."
+            helperText="Stored encrypted on the server for this account."
             />
             <SettingsInput
             label="Model"
@@ -569,13 +613,11 @@ const ProviderSettingsPanel = ({ provider, settings, onSettingChange }) => {
             placeholder="http://localhost:11434/v1"
             helperText="Base URL that exposes /chat/completions and /models."
             />
-            <SettingsInput
+            <ApiKeyInput
             label="API Key (optional)"
-            type="password"
-            value={settings.openaiCompatibleApiKey ?? ""}
-            onChange={(value) => onSettingChange("openaiCompatibleApiKey", value)}
+            provider="openai-compatible"
             placeholder="Leave empty for local Ollama"
-            helperText="Use a bearer token if your gateway requires authentication."
+            helperText="Use a bearer token if your gateway requires authentication. Stored encrypted on the server for this account."
             />
             <SettingsInput
             label="Model"

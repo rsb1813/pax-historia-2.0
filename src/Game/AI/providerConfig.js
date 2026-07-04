@@ -1,4 +1,10 @@
 /*! Open Historia — portions (reasoning-effort toggle persistence) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
+// AI 프로바이더의 비밀이 아닌 설정(엔드포인트/모델/커스텀파라미터/활성 프로바이더/추론
+// 토글)을 계정 설정 캐시(runtime/accountSettings.js)에서 읽고 쓴다. API 키는 이 파일이
+// 다루지 않는다 — hasProviderApiKey/revealProviderApiKey/setProviderApiKey(모두
+// accountSettings.js)를 직접 사용한다.
+import { getAccountSettings, patchAccountSettings } from "../../runtime/accountSettings.js";
+
 export const DEFAULT_PROVIDER = "gemini";
 
 export const PROVIDER_OPTIONS = [
@@ -32,53 +38,23 @@ export const PROVIDER_OPTIONS = [
     },
 ];
 
-const PROVIDER_SETTINGS = {
-    gemini: {
-        apiKey: { storageKey: "gemini_api_key", defaultValue: "" },
-        model: { storageKey: "gemini_model", defaultValue: "gemini-3.1-flash-lite-preview" },
-        customParams: { storageKey: "gemini_custom_params", defaultValue: "" },
-    },
-    openai: {
-        apiKey: { storageKey: "openai_api_key", defaultValue: "" },
-        model: { storageKey: "openai_model", defaultValue: "" },
-        customParams: { storageKey: "openai_custom_params", defaultValue: "" },
-    },
-    anthropic: {
-        apiKey: { storageKey: "anthropic_api_key", defaultValue: "" },
-        // Empty means "use the real Anthropic API" (main.jsx's ANTHROPIC_API_ENDPOINT
-        // default) — set this to point at a self-hosted Anthropic-compatible proxy.
-        endpoint: { storageKey: "anthropic_endpoint", defaultValue: "" },
-        model: { storageKey: "anthropic_model", defaultValue: "claude-haiku-4-5" },
-        customParams: { storageKey: "anthropic_custom_params", defaultValue: "" },
-    },
-    "openai-compatible": {
-        apiKey: { storageKey: "openai_compatible_api_key", defaultValue: "" },
-        endpoint: {
-            storageKey: "openai_compatible_endpoint",
-            legacyKeys: ["custom_api_endpoint"],
-            defaultValue: "http://localhost:11434/v1",
-        },
-        model: {
-            storageKey: "openai_compatible_model",
-            legacyKeys: ["custom_api_model"],
-            defaultValue: "",
-        },
-        customParams: { storageKey: "openai_compatible_custom_params", defaultValue: "" },
-    },
+// Which non-secret fields exist per provider in accountSettings' ai.* namespace
+// (see server/userSettings.js DEFAULT_SETTINGS.ai).
+const PROVIDER_FIELDS = {
+    gemini: ["model", "customParams"],
+    openai: ["model", "customParams"],
+    anthropic: ["endpoint", "model", "customParams"],
+    "openai-compatible": ["endpoint", "model", "customParams"],
 };
 
 const FORM_FIELD_MAP = {
-    geminiApiKey: { provider: "gemini", field: "apiKey" },
     geminiModel: { provider: "gemini", field: "model" },
     geminiCustomParams: { provider: "gemini", field: "customParams" },
-    openaiApiKey: { provider: "openai", field: "apiKey" },
     openaiModel: { provider: "openai", field: "model" },
     openaiCustomParams: { provider: "openai", field: "customParams" },
-    anthropicApiKey: { provider: "anthropic", field: "apiKey" },
     anthropicEndpoint: { provider: "anthropic", field: "endpoint" },
     anthropicModel: { provider: "anthropic", field: "model" },
     anthropicCustomParams: { provider: "anthropic", field: "customParams" },
-    openaiCompatibleApiKey: { provider: "openai-compatible", field: "apiKey" },
     openaiCompatibleEndpoint: { provider: "openai-compatible", field: "endpoint" },
     openaiCompatibleModel: { provider: "openai-compatible", field: "model" },
     openaiCompatibleCustomParams: { provider: "openai-compatible", field: "customParams" },
@@ -88,31 +64,17 @@ function isSupportedProvider(value) {
     return PROVIDER_OPTIONS.some((provider) => provider.value === value);
 }
 
-function readStoredValue(setting) {
-    if (!setting?.storageKey) return setting?.defaultValue ?? "";
-
-    const primaryValue = localStorage.getItem(setting.storageKey);
-    if (primaryValue !== null) return primaryValue;
-
-    for (const legacyKey of setting.legacyKeys ?? []) {
-        const legacyValue = localStorage.getItem(legacyKey);
-        if (legacyValue !== null) return legacyValue;
-    }
-
-    return setting.defaultValue ?? "";
-}
-
-function getSettingConfig(provider, field) {
-    return PROVIDER_SETTINGS[normalizeProvider(provider)]?.[field] ?? null;
-}
-
 export function normalizeProvider(provider) {
     if (provider === "custom") return "openai-compatible";
     return isSupportedProvider(provider) ? provider : DEFAULT_PROVIDER;
 }
 
 export function getStoredProvider() {
-    return normalizeProvider(localStorage.getItem("api_provider"));
+    return normalizeProvider(getAccountSettings().ai?.activeProvider);
+}
+
+export function setStoredProvider(provider) {
+    patchAccountSettings({ ai: { activeProvider: normalizeProvider(provider) } });
 }
 
 export function getProviderMeta(provider) {
@@ -126,21 +88,21 @@ export function providerSupportsModelDiscovery(provider) {
 }
 
 export function getProviderField(provider, field) {
-    const setting = getSettingConfig(provider, field);
-    return setting ? readStoredValue(setting) : "";
+    const normalized = normalizeProvider(provider);
+    if (!PROVIDER_FIELDS[normalized]?.includes(field)) return "";
+    return getAccountSettings().ai?.[normalized]?.[field] ?? "";
 }
 
 export function setProviderField(provider, field, value) {
-    const setting = getSettingConfig(provider, field);
-    if (!setting?.storageKey) return;
-    localStorage.setItem(setting.storageKey, value ?? "");
+    const normalized = normalizeProvider(provider);
+    if (!PROVIDER_FIELDS[normalized]?.includes(field)) return;
+    patchAccountSettings({ ai: { [normalized]: { [field]: value ?? "" } } });
 }
 
 export function getProviderSettings(provider) {
     const normalized = normalizeProvider(provider);
     return {
         provider: normalized,
-        apiKey: getProviderField(normalized, "apiKey"),
         endpoint: getProviderField(normalized, "endpoint"),
         model: getProviderField(normalized, "model"),
         customParams: getProviderField(normalized, "customParams"),
@@ -149,14 +111,12 @@ export function getProviderSettings(provider) {
 
 // Global "model reasoning" toggle — applied by callAI in every provider mode
 // (Gemini thinkingConfig, OpenAI/compatible reasoning_effort, Anthropic thinking).
-const REASONING_STORAGE_KEY = "ai_reasoning_enabled";
-
 export function getReasoningEnabled() {
-    return localStorage.getItem(REASONING_STORAGE_KEY) === "1";
+    return Boolean(getAccountSettings().ai?.reasoningEnabled);
 }
 
 export function setReasoningEnabled(enabled) {
-    localStorage.setItem(REASONING_STORAGE_KEY, enabled ? "1" : "0");
+    patchAccountSettings({ ai: { reasoningEnabled: Boolean(enabled) } });
 }
 
 export function loadProviderSettingsFormState() {
