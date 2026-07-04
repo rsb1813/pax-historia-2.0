@@ -62,6 +62,8 @@ const uniqueId = (desired) => {
   return id;
 };
 
+// Bootstrap only — doesn't touch ownership, so (like libraryStore.js's
+// ensureScenarioStore/ensureGameStore) it takes no userId.
 export const ensureMapEditorStore = () => {
   ensureDir(DOCS_DIR);
   if (!fs.existsSync(MANIFEST_PATH)) saveManifest({ order: [] });
@@ -74,27 +76,51 @@ const summarize = (doc) => ({
   regionCount: doc.regions?.features?.length ?? 0,
   featureCount: doc.features?.length ?? 0,
   typeCount: doc.types?.length ?? 0,
+  ownerId: doc.ownerId,
+  shared: doc.shared === true,
   updatedAt: doc.updatedAt,
   createdAt: doc.createdAt,
 });
 
-export const getMapEditorCatalog = () => {
+// Fail-closed: a document with neither ownerId===userId nor shared:true is
+// invisible, same rule as scenarios in libraryStore.js.
+const requireUserId = (userId) => {
+  if (!userId) throw new Error("userId is required");
+  return String(userId);
+};
+
+const isVisible = (doc, userId) => Boolean(doc) && (doc.ownerId === userId || doc.shared === true);
+const isOwned = (doc, userId) => Boolean(doc) && doc.ownerId === userId;
+
+export const getMapEditorCatalog = (userId) => {
+  requireUserId(userId);
   const manifest = getManifest();
   return manifest.order
     .map((id) => {
       const doc = readJson(docPath(id), null);
-      return doc ? summarize(doc) : null;
+      return isVisible(doc, userId) ? summarize(doc) : null;
     })
     .filter(Boolean);
 };
 
-export const getMapEditorDocument = (id) => {
+// Read-only access requires VISIBILITY (owner or shared).
+export const getMapEditorDocument = (userId, id) => {
+  requireUserId(userId);
   const doc = readJson(docPath(id), null);
-  if (!doc) throw new Error(`Map document not found: ${id}`);
+  if (!isVisible(doc, userId)) throw new Error(`Map document not found: ${id}`);
   return doc;
 };
 
-export const createMapEditorDocument = (body = {}) => {
+// Mutations (update/delete) require OWNERSHIP — shared means readable by
+// everyone, not editable by everyone (same rule as scenarios).
+const requireOwnedDocument = (userId, id) => {
+  const doc = readJson(docPath(id), null);
+  if (!isOwned(doc, userId)) throw new Error(`Map document not found: ${id}`);
+  return doc;
+};
+
+export const createMapEditorDocument = (userId, body = {}) => {
+  requireUserId(userId);
   ensureMapEditorStore();
   const now = new Date().toISOString();
   const name = String(body.name || body.metadata?.name || "Untitled Map").trim() || "Untitled Map";
@@ -107,6 +133,10 @@ export const createMapEditorDocument = (body = {}) => {
     types: body.types || [],
     regions: body.regions || { type: "FeatureCollection", features: [] },
     features: body.features || [],
+    // New content is private by default — no UI exists yet to mark it shared
+    // (mirrors createScenario's `shared` opt-in in libraryStore.js).
+    ownerId: userId,
+    shared: body.shared === true,
     createdAt: now,
     updatedAt: now,
   };
@@ -117,12 +147,15 @@ export const createMapEditorDocument = (body = {}) => {
   return doc;
 };
 
-export const updateMapEditorDocument = (id, updates = {}) => {
-  const existing = getMapEditorDocument(id);
+export const updateMapEditorDocument = (userId, id, updates = {}) => {
+  requireUserId(userId);
+  const existing = requireOwnedDocument(userId, id);
   const doc = {
     ...existing,
     ...updates,
     id,
+    ownerId: existing.ownerId,
+    shared: typeof updates.shared === "boolean" ? updates.shared : existing.shared,
     name: String(updates.name || updates.metadata?.name || existing.name).trim() || existing.name,
     metadata: { ...existing.metadata, ...(updates.metadata || {}) },
     updatedAt: new Date().toISOString(),
@@ -136,7 +169,9 @@ export const updateMapEditorDocument = (id, updates = {}) => {
   return doc;
 };
 
-export const deleteMapEditorDocument = (id) => {
+export const deleteMapEditorDocument = (userId, id) => {
+  requireUserId(userId);
+  requireOwnedDocument(userId, id);
   if (fs.existsSync(docPath(id))) fs.rmSync(docPath(id));
   const manifest = getManifest();
   manifest.order = manifest.order.filter((x) => x !== id);

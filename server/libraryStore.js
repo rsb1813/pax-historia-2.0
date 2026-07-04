@@ -2,6 +2,7 @@
 import fs from "fs";
 import path from "path";
 import url from "url";
+import { getSettings, patchSettings } from "./userSettings.js";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.join(__dirname, "..");
@@ -11,12 +12,10 @@ const SERVER_DATA_DIR = path.join(__dirname, "data");
 const SCENARIOS_DIR = path.join(SERVER_DATA_DIR, "scenarios");
 const GAMES_DIR = path.join(SERVER_DATA_DIR, "games");
 const SCENARIO_MANIFEST_PATH = path.join(SERVER_DATA_DIR, "scenario-manifest.json");
-const GAME_MANIFEST_PATH = path.join(SERVER_DATA_DIR, "game-manifest.json");
 
 const PMTILES_ASSETS_DIR = path.join(PUBLIC_DIR, "assets");
 
 const DEFAULT_SCENARIO_ID = "default";
-const DEFAULT_GAME_ID = "default";
 
 // ---------------------------------------------------------------------------
 // One naming scheme for authors: FULL COUNTRY NAMES work everywhere a country
@@ -128,6 +127,9 @@ const BUILT_IN_SCENARIO_DEFAULT_DATE = "2016-01-01";
 const SCENARIO_BUNDLE_SCHEMA = "pax-historia-scenario-bundle";
 const SCENARIO_BUNDLE_VERSION = 1;
 
+// ownerId "" (no owner yet) + shared:false is the fail-closed default: a
+// record with neither a real owner nor shared:true is invisible to everyone
+// until something (creation, migration) explicitly assigns an owner.
 const DEFAULT_SCENARIO_META = {
   accentColor: "#7c3aed",
   description: "Server-backed base scenario",
@@ -135,9 +137,12 @@ const DEFAULT_SCENARIO_META = {
   heroSubtitle: "Editable server-backed scenario template.",
   heroTitle: "Modern Day",
   name: "Modern Day",
+  ownerId: "",
+  shared: false,
   subtitle: "Base template",
 };
 
+// Games are never shared — no `shared` field.
 const DEFAULT_GAME_META = {
   accentColor: "#7c3aed",
   description: "Active playable game",
@@ -145,6 +150,7 @@ const DEFAULT_GAME_META = {
   heroSubtitle: "Playable campaign session",
   heroTitle: "Modern Day",
   name: "Modern Day Session",
+  ownerId: "",
   scenarioId: DEFAULT_SCENARIO_ID,
   subtitle: "Current campaign",
 };
@@ -371,62 +377,42 @@ const buildGameAssetUrl = (gameId, assetKey, cacheToken) =>
   cacheToken ?? "",
 )}`;
 
+// scenario-manifest.json's `order` is the SHARED base substrate: every
+// scenario (owned by anyone) that has ever been touched gets a slot in it.
+// Per-user "selected scenario" no longer lives here — see userSettings.js
+// (library.selectedScenarioId). Each user's effective, ordered scenario list
+// is produced by filtering this shared order down to what they can see
+// (owned or shared) in getScenarioCatalog — that filtering IS the "splice
+// each user's private scenarios into their own view" behavior: a user's own
+// private scenario keeps whatever position it was inserted at in this shared
+// timeline, while other users' private scenarios are filtered out.
 const getScenarioManifest = () => {
   const manifest = readJsonFile(SCENARIO_MANIFEST_PATH, null);
 
   if (manifest && Array.isArray(manifest.order)) {
     return {
       order: manifest.order,
-      selectedScenarioId:
-      String(manifest.selectedScenarioId ?? manifest.activeScenarioId ?? "").trim() ||
-      DEFAULT_SCENARIO_ID,
       version: 2,
     };
   }
 
   return {
     order: [DEFAULT_SCENARIO_ID],
-    selectedScenarioId: DEFAULT_SCENARIO_ID,
     version: 2,
   };
 };
 
 const saveScenarioManifest = (manifest) => {
   writeJsonFile(SCENARIO_MANIFEST_PATH, {
-    activeScenarioId: manifest.selectedScenarioId,
     order: Array.from(new Set(manifest.order ?? [DEFAULT_SCENARIO_ID])),
-                selectedScenarioId: manifest.selectedScenarioId,
                 version: 2,
   });
 };
 
-const getGameManifest = () => {
-  const manifest = readJsonFile(GAME_MANIFEST_PATH, null);
-
-  if (manifest && Array.isArray(manifest.order)) {
-    return {
-      activeGameId: String(manifest.activeGameId ?? "").trim(),
-      order: manifest.order,
-      version: 2,
-    };
-  }
-
-  // No games yet — nothing is created implicitly; the player starts their
-  // first game from a scenario.
-  return {
-    activeGameId: "",
-    order: [],
-    version: 2,
-  };
-};
-
-const saveGameManifest = (manifest) => {
-  writeJsonFile(GAME_MANIFEST_PATH, {
-    activeGameId: manifest.activeGameId ?? "",
-    order: Array.from(new Set(manifest.order ?? [])),
-                version: 2,
-  });
-};
+// Games are always private (never shared), so there is no shared/global game
+// manifest anymore — order + active game live entirely in each user's own
+// settings.json (library.gameOrder / library.activeGameId, via
+// userSettings.js). game-manifest.json is no longer read or written here.
 
 const readScenarioMeta = (scenarioId) => {
   const raw = readJsonFile(getScenarioMetaPath(scenarioId), {});
@@ -448,6 +434,9 @@ const readScenarioMeta = (scenarioId) => {
     heroTitle: String(raw?.heroTitle ?? "").trim() || name,
     id: scenarioId,
     name,
+    // "" (no owner) is the fail-closed default — see DEFAULT_SCENARIO_META.
+    ownerId: String(raw?.ownerId ?? "").trim(),
+    shared: raw?.shared === true,
     subtitle,
     updatedAt: raw?.updatedAt ?? new Date().toISOString(),
   };
@@ -492,6 +481,8 @@ const readGameMeta = (gameId) => {
     heroTitle: String(raw?.heroTitle ?? "").trim() || name,
     id: gameId,
     name,
+    // "" (no owner) is the fail-closed default — see DEFAULT_GAME_META.
+    ownerId: String(raw?.ownerId ?? "").trim(),
     scenarioId: String(raw?.scenarioId ?? "").trim() || DEFAULT_SCENARIO_ID,
     subtitle,
     updatedAt: raw?.updatedAt ?? new Date().toISOString(),
@@ -844,9 +835,6 @@ const ensureDefaultScenario = () => {
   if (!manifest.order.includes(DEFAULT_SCENARIO_ID)) {
     manifest.order.unshift(DEFAULT_SCENARIO_ID);
   }
-  if (!manifest.selectedScenarioId) {
-    manifest.selectedScenarioId = DEFAULT_SCENARIO_ID;
-  }
   saveScenarioManifest(manifest);
 };
 
@@ -925,12 +913,21 @@ const resolveOrderedIds = (manifestOrder, rootDir, defaultId) => {
   return ordered;
 };
 
+// Deliberately GLOBAL and cross-tenant: this only counts how many games (of
+// ANY owner) still depend on a scenario, for deleteScenario's "still in use"
+// guard. Scoping it to one user's games would let that user delete a shared
+// scenario another user is still playing, so it enumerates every game
+// directory directly instead of going through any per-user filtered catalog.
 const getScenarioUsageCountMap = () => {
   ensureGameStore();
   const counts = new Map();
-  const gameOrder = resolveOrderedIds(getGameManifest().order, GAMES_DIR, DEFAULT_GAME_ID);
+  const gameIds = fs.existsSync(GAMES_DIR)
+  ? fs.readdirSync(GAMES_DIR, { withFileTypes: true })
+  .filter((entry) => entry.isDirectory())
+  .map((entry) => entry.name)
+  : [];
 
-  for (const gameId of gameOrder) {
+  for (const gameId of gameIds) {
     const metaPath = getGameMetaPath(gameId);
     if (!fs.existsSync(metaPath)) {
       continue;
@@ -943,11 +940,118 @@ const getScenarioUsageCountMap = () => {
   return counts;
 };
 
-const getScenarioCatalog = () => {
+// ---------------------------------------------------------------------------
+// Ownership/visibility helpers. Scenarios and map-editor documents can be
+// shared (visible to everyone); games never are. Fail-closed everywhere: a
+// record with neither a matching ownerId nor shared:true does not exist as
+// far as any function here is concerned — errors read the same as a missing
+// id, so a private record's existence is never leaked to non-owners.
+// ---------------------------------------------------------------------------
+const requireUserId = (userId) => {
+  if (!userId) {
+    throw new Error("userId is required");
+  }
+  return String(userId);
+};
+
+// Read-only "can this user see it" check (owner OR shared) — used to gate
+// seeding a new scenario/game from an existing scenario, downloading its
+// assets, and exporting its bundle.
+const resolveVisibleScenarioMeta = (userId, scenarioId) => {
+  if (!scenarioId || !fs.existsSync(getScenarioMetaPath(scenarioId))) {
+    return null;
+  }
+  const meta = readScenarioMeta(scenarioId);
+  return meta.ownerId === userId || meta.shared === true ? meta : null;
+};
+
+const requireVisibleScenarioMeta = (userId, scenarioId) => {
+  const meta = resolveVisibleScenarioMeta(userId, scenarioId);
+  if (!meta) {
+    throw new Error(`Scenario not found: ${scenarioId}`);
+  }
+  return meta;
+};
+
+// Stricter "can this user mutate/clone it" check (owner only) — used to gate
+// updating, deleting, and uploading/removing assets on a scenario, and
+// cloning an existing game via seedGameId. Being shared makes a scenario
+// readable by everyone, not editable by everyone.
+const resolveOwnedScenarioMeta = (userId, scenarioId) => {
+  if (!scenarioId || !fs.existsSync(getScenarioMetaPath(scenarioId))) {
+    return null;
+  }
+  const meta = readScenarioMeta(scenarioId);
+  return meta.ownerId === userId ? meta : null;
+};
+
+const requireOwnedScenarioMeta = (userId, scenarioId) => {
+  const meta = resolveOwnedScenarioMeta(userId, scenarioId);
+  if (!meta) {
+    throw new Error(`Scenario not found: ${scenarioId}`);
+  }
+  return meta;
+};
+
+// Games are never shared, so "visible" and "owned" are the same check.
+const resolveOwnedGameMeta = (userId, gameId) => {
+  if (!gameId || !fs.existsSync(getGameMetaPath(gameId))) {
+    return null;
+  }
+  const meta = readGameMeta(gameId);
+  return meta.ownerId === userId ? meta : null;
+};
+
+const requireOwnedGameMeta = (userId, gameId) => {
+  const meta = resolveOwnedGameMeta(userId, gameId);
+  if (!meta) {
+    throw new Error(`Game not found: ${gameId}`);
+  }
+  return meta;
+};
+
+// Per-user game ordering. GAMES_DIR holds every user's games side by side (no
+// per-account subdirectory), so this must scan the whole directory — but it
+// filters to games owned by `userId` before returning, so no other user's
+// game id is ever exposed to, or persisted into, this user's own settings.
+const resolveOwnedGameOrder = (userId, storedOrder) => {
+  const allGameIds = fs.existsSync(GAMES_DIR)
+  ? fs.readdirSync(GAMES_DIR, { withFileTypes: true })
+  .filter((entry) => entry.isDirectory())
+  .map((entry) => entry.name)
+  : [];
+
+  const ownedIds = new Set(
+    allGameIds.filter(
+      (gameId) => fs.existsSync(getGameMetaPath(gameId)) && readGameMeta(gameId).ownerId === userId,
+    ),
+  );
+
+  const ordered = [];
+  for (const gameId of storedOrder ?? []) {
+    if (ownedIds.has(gameId) && !ordered.includes(gameId)) {
+      ordered.push(gameId);
+    }
+  }
+  for (const gameId of allGameIds) {
+    if (ownedIds.has(gameId) && !ordered.includes(gameId)) {
+      ordered.push(gameId);
+    }
+  }
+
+  return ordered;
+};
+
+// Fail-closed: only scenarios owned by `userId` or explicitly shared appear
+// here. A scenario with neither is invisible to every caller, `userId`
+// included if it isn't theirs.
+const getScenarioCatalog = (userId) => {
+  requireUserId(userId);
   ensureScenarioStore();
   const usageCounts = getScenarioUsageCountMap();
   const manifest = getScenarioManifest();
   const orderedScenarioIds = resolveOrderedIds(manifest.order, SCENARIOS_DIR, DEFAULT_SCENARIO_ID);
+  const settings = getSettings(userId);
 
   const scenarios = orderedScenarioIds
   .map((scenarioId) => {
@@ -957,6 +1061,10 @@ const getScenarioCatalog = () => {
     }
 
     const meta = readScenarioMeta(scenarioId);
+    if (meta.ownerId !== userId && meta.shared !== true) {
+      return null;
+    }
+
     const assetStatus = getScenarioAssetStatus(scenarioId);
     const cacheToken = `${scenarioId}-${meta.updatedAt}`;
 
@@ -975,18 +1083,26 @@ const getScenarioCatalog = () => {
   })
   .filter(Boolean);
 
-  // Fall back to the first scenario that actually exists — the built-in one
-  // may have been deleted.
-  const selectedScenarioId = scenarios.some((scenario) => scenario.id === manifest.selectedScenarioId)
-  ? manifest.selectedScenarioId
+  // Fall back to the first scenario that actually exists/is visible — the
+  // built-in one may have been deleted, or the stored selection may no
+  // longer be visible to this user.
+  const storedSelectedScenarioId = String(settings.library.selectedScenarioId ?? "").trim();
+  const selectedScenarioId = scenarios.some((scenario) => scenario.id === storedSelectedScenarioId)
+  ? storedSelectedScenarioId
   : (scenarios[0]?.id ?? "");
 
-  if (selectedScenarioId !== manifest.selectedScenarioId) {
-    saveScenarioManifest({
-      ...manifest,
-      order: orderedScenarioIds,
-      selectedScenarioId,
-    });
+  if (selectedScenarioId !== storedSelectedScenarioId) {
+    patchSettings(userId, { library: { selectedScenarioId } });
+  }
+
+  // Self-heal the shared substrate order (drops ids for scenarios that no
+  // longer exist on disk) — harmless to persist since it never contains more
+  // than ids, never private content.
+  if (
+    orderedScenarioIds.length !== manifest.order.length ||
+    orderedScenarioIds.some((id, index) => id !== manifest.order[index])
+  ) {
+    saveScenarioManifest({ order: orderedScenarioIds });
   }
 
   return {
@@ -996,12 +1112,15 @@ const getScenarioCatalog = () => {
   };
 };
 
-const getGameCatalog = () => {
+// Fail-closed: only games owned by `userId` appear here — games are never
+// shared, so ownership is the entire visibility rule.
+const getGameCatalog = (userId) => {
+  requireUserId(userId);
   ensureGameStore();
-  const scenarioCatalog = getScenarioCatalog();
+  const scenarioCatalog = getScenarioCatalog(userId);
   const scenarioLookup = new Map(scenarioCatalog.scenarios.map((scenario) => [scenario.id, scenario]));
-  const manifest = getGameManifest();
-  const orderedGameIds = resolveOrderedIds(manifest.order, GAMES_DIR, DEFAULT_GAME_ID);
+  const settings = getSettings(userId);
+  const orderedGameIds = resolveOwnedGameOrder(userId, settings.library.gameOrder);
 
   const games = orderedGameIds
   .map((gameId) => {
@@ -1011,6 +1130,10 @@ const getGameCatalog = () => {
     }
 
     const meta = readGameMeta(gameId);
+    if (meta.ownerId !== userId) {
+      return null;
+    }
+
     const assetStatus = getGameAssetStatus(gameId);
     const gameData = readJsonFile(getGameJsonPath(gameId, "game"), {});
     const actions = readJsonFile(getGameJsonPath(gameId, "actions"), []);
@@ -1045,16 +1168,13 @@ const getGameCatalog = () => {
   })
   .filter(Boolean);
 
-  const activeGameId = games.some((game) => game.id === manifest.activeGameId)
-  ? manifest.activeGameId
+  const storedActiveGameId = String(settings.library.activeGameId ?? "").trim();
+  const activeGameId = games.some((game) => game.id === storedActiveGameId)
+  ? storedActiveGameId
   : games[0]?.id ?? "";
 
-  if (activeGameId !== manifest.activeGameId) {
-    saveGameManifest({
-      ...manifest,
-      activeGameId,
-      order: orderedGameIds,
-    });
+  if (activeGameId !== storedActiveGameId) {
+    patchSettings(userId, { library: { activeGameId, gameOrder: orderedGameIds } });
   }
 
   return {
@@ -1063,9 +1183,10 @@ const getGameCatalog = () => {
   };
 };
 
-const getLibraryCatalog = () => {
-  const scenarioCatalog = getScenarioCatalog();
-  const gameCatalog = getGameCatalog();
+const getLibraryCatalog = (userId) => {
+  requireUserId(userId);
+  const scenarioCatalog = getScenarioCatalog(userId);
+  const gameCatalog = getGameCatalog(userId);
   const selectedScenario =
   scenarioCatalog.scenarios.find((scenario) => scenario.id === scenarioCatalog.selectedScenarioId) ??
   scenarioCatalog.scenarios[0] ??
@@ -1093,8 +1214,8 @@ const getLibraryCatalog = () => {
   };
 };
 
-const getScenarioSummary = (scenarioId) => {
-  const catalog = getScenarioCatalog();
+const getScenarioSummary = (userId, scenarioId) => {
+  const catalog = getScenarioCatalog(userId);
   const scenario = catalog.scenarios.find((entry) => entry.id === scenarioId);
 
   if (!scenario) {
@@ -1104,8 +1225,8 @@ const getScenarioSummary = (scenarioId) => {
   return scenario;
 };
 
-const getGameSummary = (gameId) => {
-  const catalog = getGameCatalog();
+const getGameSummary = (userId, gameId) => {
+  const catalog = getGameCatalog(userId);
   const game = catalog.games.find((entry) => entry.id === gameId);
 
   if (!game) {
@@ -1115,8 +1236,8 @@ const getGameSummary = (gameId) => {
   return game;
 };
 
-const getScenarioDetails = (scenarioId) => {
-  const summary = getScenarioSummary(scenarioId);
+const getScenarioDetails = (userId, scenarioId) => {
+  const summary = getScenarioSummary(userId, scenarioId);
 
   return {
     assetStatus: summary.assetStatus,
@@ -1133,8 +1254,8 @@ const getScenarioDetails = (scenarioId) => {
   };
 };
 
-const getGameDetails = (gameId) => {
-  const summary = getGameSummary(gameId);
+const getGameDetails = (userId, gameId) => {
+  const summary = getGameSummary(userId, gameId);
 
   return {
     assetStatus: summary.assetStatus,
@@ -1148,42 +1269,40 @@ const getGameDetails = (gameId) => {
       world: readJsonFile(getGameJsonPath(gameId, "world"), {}),
     },
     game: summary,
-    scenario: getScenarioSummary(summary.scenarioId),
+    scenario: getScenarioSummary(userId, summary.scenarioId),
   };
 };
 
-const setSelectedScenario = (scenarioId) => {
+// Selecting a scenario only requires it be VISIBLE (owned or shared) — you
+// can make a shared scenario your active one without owning it.
+const setSelectedScenario = (userId, scenarioId) => {
+  requireUserId(userId);
   ensureScenarioStore();
-
-  if (!fs.existsSync(getScenarioDirectory(scenarioId))) {
-    throw new Error(`Scenario not found: ${scenarioId}`);
-  }
+  requireVisibleScenarioMeta(userId, scenarioId);
 
   const manifest = getScenarioManifest();
-  manifest.selectedScenarioId = scenarioId;
   manifest.order = resolveOrderedIds(manifest.order, SCENARIOS_DIR, DEFAULT_SCENARIO_ID).filter(
     (entry) => entry !== scenarioId,
   );
   manifest.order.unshift(scenarioId);
   saveScenarioManifest(manifest);
-  return getLibraryCatalog();
+  patchSettings(userId, { library: { selectedScenarioId: scenarioId } });
+  return getLibraryCatalog(userId);
 };
 
-const setActiveGame = (gameId) => {
+// Games are never shared, so making one "active" requires owning it.
+const setActiveGame = (userId, gameId) => {
+  requireUserId(userId);
   ensureGameStore();
+  requireOwnedGameMeta(userId, gameId);
 
-  if (!fs.existsSync(getGameDirectory(gameId))) {
-    throw new Error(`Game not found: ${gameId}`);
-  }
-
-  const manifest = getGameManifest();
-  manifest.activeGameId = gameId;
-  manifest.order = resolveOrderedIds(manifest.order, GAMES_DIR, DEFAULT_GAME_ID).filter(
+  const settings = getSettings(userId);
+  const nextOrder = resolveOwnedGameOrder(userId, settings.library.gameOrder).filter(
     (entry) => entry !== gameId,
   );
-  manifest.order.unshift(gameId);
-  saveGameManifest(manifest);
-  return getLibraryCatalog();
+  nextOrder.unshift(gameId);
+  patchSettings(userId, { library: { activeGameId: gameId, gameOrder: nextOrder } });
+  return getLibraryCatalog(userId);
 };
 
 const mergeJsonAsset = (targetPath, patch, fallback) => {
@@ -1197,7 +1316,7 @@ const mergeJsonAsset = (targetPath, patch, fallback) => {
   return next;
 };
 
-const createScenario = ({
+const createScenario = (userId, {
   accentColor,
   countryNameOverrides,
   description,
@@ -1208,16 +1327,20 @@ const createScenario = ({
   name,
   seedScenarioId,
   setActive,
+  shared,
   subtitle,
 } = {}) => {
+  requireUserId(userId);
   ensureScenarioStore();
 
   const scenarioId = ensureUniqueId(id || name || "scenario", "scenario");
   const scenarioDir = getScenarioDirectory(scenarioId);
-  const sourceScenario =
-  seedScenarioId && fs.existsSync(getScenarioDirectory(seedScenarioId))
-  ? getScenarioSummary(seedScenarioId)
-  : null;
+  // Seeding is gated by VISIBILITY (owner or shared) — this is what lets a
+  // user base a new scenario on someone else's shared one. If the requested
+  // source isn't visible to `userId` (or doesn't exist), it's silently
+  // treated as absent and the new scenario seeds from the built-in default
+  // instead, same as an unknown seedScenarioId always has.
+  const sourceScenario = seedScenarioId ? resolveVisibleScenarioMeta(userId, seedScenarioId) : null;
 
   ensureDirectory(scenarioDir);
   ensureDirectory(path.join(scenarioDir, "storage"));
@@ -1262,6 +1385,13 @@ const createScenario = ({
                 sourceScenario?.heroTitle ||
                 DEFAULT_SCENARIO_META.heroTitle,
                 name: String(name ?? "").trim() || "Custom Scenario",
+                // New content is always private by default this phase — no
+                // UI exists yet to mark it shared (only migration does that,
+                // once, for pre-existing content). `shared` is still accepted
+                // here as an explicit opt-in for callers that already know
+                // they want it (e.g. tooling), defaulting to false.
+                ownerId: userId,
+                shared: shared === true,
                 subtitle:
                 String(subtitle ?? "").trim() ||
                 String(description ?? "").trim() ||
@@ -1275,15 +1405,15 @@ const createScenario = ({
     (entry) => entry !== scenarioId,
   );
   manifest.order.unshift(scenarioId);
-  if (setActive) {
-    manifest.selectedScenarioId = scenarioId;
-  }
   saveScenarioManifest(manifest);
+  if (setActive) {
+    patchSettings(userId, { library: { selectedScenarioId: scenarioId } });
+  }
 
-  return getScenarioDetails(scenarioId);
+  return getScenarioDetails(userId, scenarioId);
 };
 
-const createGame = ({
+const createGame = (userId, {
   accentColor,
   description,
   eyebrow,
@@ -1296,6 +1426,7 @@ const createGame = ({
   setActive,
   subtitle,
 } = {}) => {
+  requireUserId(userId);
   ensureGameStore();
 
   const resolvedGameId = ensureUniqueId(id || name || "game", "game");
@@ -1306,17 +1437,28 @@ const createGame = ({
   let sourceScenario = null;
   let sourceGame = null;
 
-  if (seedGameId && fs.existsSync(getGameDirectory(seedGameId))) {
-    sourceGame = getGameSummary(seedGameId);
+  // Cloning an existing game is gated by OWNERSHIP — games are never shared,
+  // so seeing one in your own game list already implies you own it, but this
+  // guards direct seedGameId calls too (e.g. from a future API surface).
+  if (seedGameId) {
+    sourceGame = resolveOwnedGameMeta(userId, seedGameId);
+  }
+
+  if (sourceGame) {
     seedGameJsonFilesFromGame(resolvedGameId, seedGameId);
   } else {
+    // Starting a fresh game from a scenario is gated by VISIBILITY (owner or
+    // shared) — this is what lets a user start a game from someone else's
+    // shared scenario. Unlike the seedGameId fallback above, an invisible or
+    // missing scenarioId here is a hard error (there's nothing sensible to
+    // silently fall back to — every game needs a real source scenario).
     const nextScenarioId = String(scenarioId ?? DEFAULT_SCENARIO_ID).trim() || DEFAULT_SCENARIO_ID;
-    sourceScenario = getScenarioSummary(nextScenarioId);
+    sourceScenario = requireVisibleScenarioMeta(userId, nextScenarioId);
     seedGameJsonFilesFromScenario(resolvedGameId, nextScenarioId);
   }
 
   const createdAt = new Date().toISOString();
-  const scenarioSummary = sourceScenario ?? getScenarioSummary(sourceGame?.scenarioId ?? DEFAULT_SCENARIO_ID);
+  const scenarioSummary = sourceScenario ?? requireVisibleScenarioMeta(userId, sourceGame?.scenarioId ?? DEFAULT_SCENARIO_ID);
   const seedName = sourceGame?.name ?? scenarioSummary.name;
 
   writeJsonFile(getGameMetaPath(resolvedGameId), {
@@ -1346,6 +1488,7 @@ const createGame = ({
     scenarioSummary.heroTitle ||
     DEFAULT_GAME_META.heroTitle,
     name: String(name ?? "").trim() || `${seedName} Session`,
+                ownerId: userId,
                 scenarioId: scenarioSummary.id,
                 coverImageContentType: sourceGame?.coverImageContentType ?? null,
                 subtitle:
@@ -1356,20 +1499,27 @@ const createGame = ({
                 updatedAt: createdAt,
   });
 
-  const manifest = getGameManifest();
-  manifest.order = resolveOrderedIds(manifest.order, GAMES_DIR, DEFAULT_GAME_ID).filter(
+  const settings = getSettings(userId);
+  const nextOrder = resolveOwnedGameOrder(userId, settings.library.gameOrder).filter(
     (entry) => entry !== resolvedGameId,
   );
-  manifest.order.unshift(resolvedGameId);
-  if (setActive) {
-    manifest.activeGameId = resolvedGameId;
-  }
-  saveGameManifest(manifest);
+  nextOrder.unshift(resolvedGameId);
+  patchSettings(userId, {
+    library: {
+      activeGameId: setActive ? resolvedGameId : settings.library.activeGameId,
+      gameOrder: nextOrder,
+    },
+  });
 
-  return getGameDetails(resolvedGameId);
+  return getGameDetails(userId, resolvedGameId);
 };
 
+// Update/delete/upload are OWNER-only, even for shared scenarios: shared
+// means readable by everyone, not editable by everyone. (Beyond the literal
+// visibility-filtering spec, but the safer fail-closed default — a reviewer
+// who wants shared-editable can relax this later.)
 const updateScenario = (
+  userId,
   scenarioId,
   {
     accentColor,
@@ -1390,11 +1540,9 @@ const updateScenario = (
     worldPatch,
   } = {},
 ) => {
+  requireUserId(userId);
   ensureScenarioStore();
-
-  if (!fs.existsSync(getScenarioDirectory(scenarioId))) {
-    throw new Error(`Scenario not found: ${scenarioId}`);
-  }
+  requireOwnedScenarioMeta(userId, scenarioId);
 
   const currentMeta = readScenarioMeta(scenarioId);
   writeScenarioMeta(scenarioId, {
@@ -1443,13 +1591,14 @@ const updateScenario = (
   }
 
   if (setActive) {
-    setSelectedScenario(scenarioId);
+    setSelectedScenario(userId, scenarioId);
   }
 
-  return getScenarioDetails(scenarioId);
+  return getScenarioDetails(userId, scenarioId);
 };
 
 const updateGame = (
+  userId,
   gameId,
   {
     accentColor,
@@ -1469,11 +1618,9 @@ const updateGame = (
     worldPatch,
   } = {},
 ) => {
+  requireUserId(userId);
   ensureGameStore();
-
-  if (!fs.existsSync(getGameDirectory(gameId))) {
-    throw new Error(`Game not found: ${gameId}`);
-  }
+  requireOwnedGameMeta(userId, gameId);
 
   const currentMeta = readGameMeta(gameId);
   writeGameMeta(gameId, {
@@ -1514,14 +1661,16 @@ const updateGame = (
   }
 
   if (setActive) {
-    setActiveGame(gameId);
+    setActiveGame(userId, gameId);
   }
 
-  return getGameDetails(gameId);
+  return getGameDetails(userId, gameId);
 };
 
-const deleteScenario = (scenarioId) => {
+const deleteScenario = (userId, scenarioId) => {
+  requireUserId(userId);
   ensureScenarioStore();
+  requireOwnedScenarioMeta(userId, scenarioId);
 
   const usageCount = getScenarioUsageCountMap().get(scenarioId) ?? 0;
   if (usageCount > 0) {
@@ -1542,21 +1691,18 @@ const deleteScenario = (scenarioId) => {
   const nextOrder = resolveOrderedIds(manifest.order, SCENARIOS_DIR, DEFAULT_SCENARIO_ID).filter(
     (entry) => entry !== scenarioId,
   );
-  // Select the first remaining scenario (the deleted one may have been the
-  // built-in default — nothing resurrects it).
-  const nextSelectedScenarioId =
-  manifest.selectedScenarioId === scenarioId ? (nextOrder[0] ?? "") : manifest.selectedScenarioId;
+  saveScenarioManifest({ order: nextOrder });
+  // Per-user selection self-heals in getScenarioCatalog (falls back to the
+  // first visible scenario) the next time it's read for anyone who had this
+  // one selected — no manifest-level "active" field to fix up anymore.
 
-  saveScenarioManifest({
-    order: nextOrder,
-    selectedScenarioId: nextSelectedScenarioId,
-  });
-
-  return getLibraryCatalog();
+  return getLibraryCatalog(userId);
 };
 
-const deleteGame = (gameId) => {
+const deleteGame = (userId, gameId) => {
+  requireUserId(userId);
   ensureGameStore();
+  requireOwnedGameMeta(userId, gameId);
 
   const gameDir = getGameDirectory(gameId);
   const resolved = path.resolve(gameDir);
@@ -1568,33 +1714,36 @@ const deleteGame = (gameId) => {
 
   fs.rmSync(resolved, { force: true, recursive: true });
 
-  const manifest = getGameManifest();
-  const nextOrder = resolveOrderedIds(manifest.order, GAMES_DIR, DEFAULT_GAME_ID).filter(
+  const settings = getSettings(userId);
+  const nextOrder = resolveOwnedGameOrder(userId, settings.library.gameOrder).filter(
     (entry) => entry !== gameId,
   );
   // Deleting the active game hands off to the next one; deleting the LAST
   // game is fine too — the runtime falls back to the selected scenario's data.
   const nextActiveGameId =
-  manifest.activeGameId === gameId ? nextOrder[0] ?? "" : manifest.activeGameId;
+  settings.library.activeGameId === gameId ? nextOrder[0] ?? "" : settings.library.activeGameId;
 
-  saveGameManifest({
-    activeGameId: nextActiveGameId,
-    order: nextOrder,
+  patchSettings(userId, {
+    library: {
+      activeGameId: nextActiveGameId,
+      gameOrder: nextOrder,
+    },
   });
 
-  return getLibraryCatalog();
+  return getLibraryCatalog(userId);
 };
 
-const uploadScenarioAsset = (scenarioId, assetKey, dataBuffer, contentType = "") => {
+// Uploading/removing an asset is a mutation — OWNER-only (see updateScenario
+// comment above for why shared doesn't imply editable).
+const uploadScenarioAsset = (userId, scenarioId, assetKey, dataBuffer, contentType = "") => {
+  requireUserId(userId);
   ensureScenarioStore();
 
   if (!(assetKey in UPLOADABLE_SCENARIO_ASSET_FILES)) {
     throw new Error(`Unsupported asset key: ${assetKey}`);
   }
 
-  if (!fs.existsSync(getScenarioDirectory(scenarioId))) {
-    throw new Error(`Scenario not found: ${scenarioId}`);
-  }
+  requireOwnedScenarioMeta(userId, scenarioId);
 
   const targetPath = getScenarioUploadPath(scenarioId, assetKey);
   ensureDirectory(path.dirname(targetPath));
@@ -1605,38 +1754,38 @@ const uploadScenarioAsset = (scenarioId, assetKey, dataBuffer, contentType = "")
     ? { coverImageContentType: normalizeImageContentType(contentType) }
     : {},
   );
-  return getScenarioDetails(scenarioId);
+  return getScenarioDetails(userId, scenarioId);
 };
 
-const removeScenarioAsset = (scenarioId, assetKey) => {
+const removeScenarioAsset = (userId, scenarioId, assetKey) => {
+  requireUserId(userId);
   ensureScenarioStore();
 
   if (!(assetKey in UPLOADABLE_SCENARIO_ASSET_FILES)) {
     throw new Error(`Unsupported asset key: ${assetKey}`);
   }
 
-  if (!fs.existsSync(getScenarioDirectory(scenarioId))) {
-    throw new Error(`Scenario not found: ${scenarioId}`);
-  }
+  requireOwnedScenarioMeta(userId, scenarioId);
 
   removeFileIfPresent(getScenarioUploadPath(scenarioId, assetKey));
   writeScenarioMeta(
     scenarioId,
     assetKey === COVER_IMAGE_ASSET_KEY ? { coverImageContentType: null } : {},
   );
-  return getScenarioDetails(scenarioId);
+  return getScenarioDetails(userId, scenarioId);
 };
 
-const uploadGameAsset = (gameId, assetKey, dataBuffer, contentType = "") => {
+// Games are never shared, so upload/remove is owner-only exactly like every
+// other game operation.
+const uploadGameAsset = (userId, gameId, assetKey, dataBuffer, contentType = "") => {
+  requireUserId(userId);
   ensureGameStore();
 
   if (!(assetKey in UPLOADABLE_GAME_ASSET_FILES)) {
     throw new Error(`Unsupported asset key: ${assetKey}`);
   }
 
-  if (!fs.existsSync(getGameDirectory(gameId))) {
-    throw new Error(`Game not found: ${gameId}`);
-  }
+  requireOwnedGameMeta(userId, gameId);
 
   const targetPath = getGameUploadPath(gameId, assetKey);
   ensureDirectory(path.dirname(targetPath));
@@ -1647,38 +1796,38 @@ const uploadGameAsset = (gameId, assetKey, dataBuffer, contentType = "") => {
     ? { coverImageContentType: normalizeImageContentType(contentType) }
     : {},
   );
-  return getGameDetails(gameId);
+  return getGameDetails(userId, gameId);
 };
 
-const removeGameAsset = (gameId, assetKey) => {
+const removeGameAsset = (userId, gameId, assetKey) => {
+  requireUserId(userId);
   ensureGameStore();
 
   if (!(assetKey in UPLOADABLE_GAME_ASSET_FILES)) {
     throw new Error(`Unsupported asset key: ${assetKey}`);
   }
 
-  if (!fs.existsSync(getGameDirectory(gameId))) {
-    throw new Error(`Game not found: ${gameId}`);
-  }
+  requireOwnedGameMeta(userId, gameId);
 
   removeFileIfPresent(getGameUploadPath(gameId, assetKey));
   writeGameMeta(
     gameId,
     assetKey === COVER_IMAGE_ASSET_KEY ? { coverImageContentType: null } : {},
   );
-  return getGameDetails(gameId);
+  return getGameDetails(userId, gameId);
 };
 
-const resolveScenarioUploadAsset = (scenarioId, assetKey) => {
+// Downloading/streaming an asset only requires VISIBILITY (owner or shared)
+// — anyone who can see a shared scenario can view its cover image / pmtiles.
+const resolveScenarioUploadAsset = (userId, scenarioId, assetKey) => {
+  requireUserId(userId);
   ensureScenarioStore();
 
   if (!(assetKey in UPLOADABLE_SCENARIO_ASSET_FILES)) {
     throw new Error(`Unsupported asset key: ${assetKey}`);
   }
 
-  if (!fs.existsSync(getScenarioDirectory(scenarioId))) {
-    throw new Error(`Scenario not found: ${scenarioId}`);
-  }
+  requireVisibleScenarioMeta(userId, scenarioId);
 
   const sourcePath = getScenarioUploadPath(scenarioId, assetKey);
   if (!fs.existsSync(sourcePath)) {
@@ -1696,16 +1845,16 @@ const resolveScenarioUploadAsset = (scenarioId, assetKey) => {
   return { contentType, sourcePath };
 };
 
-const resolveGameUploadAsset = (gameId, assetKey) => {
+// Games are never shared, so downloading a game asset is owner-only.
+const resolveGameUploadAsset = (userId, gameId, assetKey) => {
+  requireUserId(userId);
   ensureGameStore();
 
   if (!(assetKey in UPLOADABLE_GAME_ASSET_FILES)) {
     throw new Error(`Unsupported asset key: ${assetKey}`);
   }
 
-  if (!fs.existsSync(getGameDirectory(gameId))) {
-    throw new Error(`Game not found: ${gameId}`);
-  }
+  requireOwnedGameMeta(userId, gameId);
 
   const sourcePath = getGameUploadPath(gameId, assetKey);
   if (!fs.existsSync(sourcePath)) {
@@ -1721,28 +1870,38 @@ const resolveGameUploadAsset = (gameId, assetKey) => {
   };
 };
 
-const getSelectedScenarioSummary = () => {
-  const catalog = getScenarioCatalog();
+const getSelectedScenarioSummary = (userId) => {
+  const catalog = getScenarioCatalog(userId);
   return (
     catalog.scenarios.find((scenario) => scenario.id === catalog.selectedScenarioId) ??
     catalog.scenarios[0]
   );
 };
 
-const getActiveGameSummary = () => {
-  const catalog = getGameCatalog();
+const getActiveGameSummary = (userId) => {
+  const catalog = getGameCatalog(userId);
   return catalog.games.find((game) => game.id === catalog.activeGameId) ?? catalog.games[0];
 };
 
-const getActiveGameId = () => getGameCatalog().activeGameId;
+const getActiveGameId = (userId) => getGameCatalog(userId).activeGameId;
 
-const getActiveRuntimeScenarioSummary = () => {
-  const activeGame = getActiveGameSummary();
+const getActiveRuntimeScenarioSummary = (userId) => {
+  const activeGame = getActiveGameSummary(userId);
   if (!activeGame) {
-    return getScenarioSummary(DEFAULT_SCENARIO_ID);
+    // No active game — fall back to this user's own selected scenario
+    // (visible-only, self-healing) rather than a hardcoded scenario id that
+    // might not be visible to them. getSelectedScenarioSummary can return
+    // undefined if this user has zero visible scenarios (e.g. pre-migration,
+    // before any scenario is owned by or shared with them) — fail with a
+    // clear error instead of letting callers hit `undefined.id`.
+    const scenario = getSelectedScenarioSummary(userId);
+    if (!scenario) {
+      throw new Error("No scenario available for this user.");
+    }
+    return scenario;
   }
 
-  return getScenarioSummary(activeGame.scenarioId);
+  return getScenarioSummary(userId, activeGame.scenarioId);
 };
 
 // Every scenario renders the custom map style: worlds that never set the flag
@@ -1756,13 +1915,14 @@ const normalizeRuntimeWorld = (assetKey, data) => {
   return data.customRegions ? data : { ...data, customRegions: true };
 };
 
-const readRuntimeJsonAsset = (assetKey) => {
+const readRuntimeJsonAsset = (userId, assetKey) => {
+  requireUserId(userId);
   ensureGameStore();
 
   // Custom region/city geometry is scenario-scoped (static map data). Resolve it
   // from the active game's scenario, mirroring how pmtiles overrides resolve.
   if (assetKey in SCENARIO_GEOJSON_ASSET_FILES) {
-    const scenario = getActiveRuntimeScenarioSummary();
+    const scenario = getActiveRuntimeScenarioSummary(userId);
     let sourcePath = getScenarioUploadPath(scenario.id, assetKey);
     if (!fs.existsSync(sourcePath)) {
       sourcePath = null;
@@ -1783,7 +1943,7 @@ const readRuntimeJsonAsset = (assetKey) => {
   }
 
   // No games yet — runtime data resolves from the scenario below.
-  const activeGame = getActiveGameSummary();
+  const activeGame = getActiveGameSummary(userId);
   const gamePath =
   activeGame && (assetKey in JSON_ASSET_FILES || assetKey in OPTIONAL_JSON_ASSET_FILES)
   ? getGameJsonPath(activeGame.id, assetKey)
@@ -1797,7 +1957,7 @@ const readRuntimeJsonAsset = (assetKey) => {
     };
   }
 
-  const scenario = getActiveRuntimeScenarioSummary();
+  const scenario = getActiveRuntimeScenarioSummary(userId);
   const scenarioPath =
   assetKey in JSON_ASSET_FILES || assetKey in OPTIONAL_JSON_ASSET_FILES
   ? getScenarioJsonPath(scenario.id, assetKey)
@@ -1835,32 +1995,38 @@ const readRuntimeJsonAsset = (assetKey) => {
   };
 };
 
-const writeRuntimeJsonAsset = (assetKey, value) => {
+// The single most likely cross-tenant leak point (see plan doc): the
+// auto-create-game branch below MUST resolve everything (active game,
+// fallback scenario, the newly created game) through `userId` — never
+// through any global/shared state — or one user's write could land in, or
+// spin up, another user's game.
+const writeRuntimeJsonAsset = (userId, assetKey, value) => {
+  requireUserId(userId);
   ensureGameStore();
 
   if (!(assetKey in JSON_ASSET_FILES) && !(assetKey in OPTIONAL_JSON_ASSET_FILES)) {
     throw new Error(`Unsupported JSON asset key: ${assetKey}`);
   }
 
-  let activeGameId = getActiveGameId();
+  let activeGameId = getActiveGameId(userId);
   if (!activeGameId) {
     // With every game deleted, the map still renders (reads fall back to the
     // selected scenario) so play LOOKS possible — but there was nowhere to
     // save, and every AI feature died on this guard. The first stateful
-    // interaction now quietly creates a real session from the selected
-    // scenario instead, which is how it always felt back when a built-in
-    // game guaranteed a write target.
-    const scenario = getSelectedScenarioSummary();
+    // interaction now quietly creates a real session from the CALLER's own
+    // selected scenario instead, which is how it always felt back when a
+    // built-in game guaranteed a write target.
+    const scenario = getSelectedScenarioSummary(userId);
     if (!scenario) {
       throw new Error("No active game — start a game from a scenario first.");
     }
-    const details = createGame({
+    const details = createGame(userId, {
       name: `${scenario.name} Session`,
       scenarioId: scenario.id,
       setActive: true,
     });
     activeGameId = details.game.id;
-    console.log(`No active game — created "${activeGameId}" from scenario "${scenario.id}".`);
+    console.log(`No active game — created "${activeGameId}" from scenario "${scenario.id}" for user ${userId}.`);
   }
   // Authors and the AI may reference countries by full name anywhere; the
   // stored form is canonical (see canonicalizeCountryRef).
@@ -1878,17 +2044,18 @@ const writeRuntimeJsonAsset = (assetKey, value) => {
   const targetPath = getGameJsonPath(activeGameId, assetKey);
   writeJsonFile(targetPath, canonical);
   writeGameMeta(activeGameId, {});
-  return readRuntimeJsonAsset(assetKey);
+  return readRuntimeJsonAsset(userId, assetKey);
 };
 
-const resolveRuntimeBinaryAsset = (assetKey) => {
+const resolveRuntimeBinaryAsset = (userId, assetKey) => {
+  requireUserId(userId);
   ensureGameStore();
 
   if (!(assetKey in PMTILES_ASSET_FILES)) {
     throw new Error(`Unsupported PMTiles asset key: ${assetKey}`);
   }
 
-  const scenario = getActiveRuntimeScenarioSummary();
+  const scenario = getActiveRuntimeScenarioSummary(userId);
   const scenarioOverridePath = getScenarioUploadPath(scenario.id, assetKey);
 
   if (fs.existsSync(scenarioOverridePath)) {
@@ -1981,9 +2148,12 @@ const buildScenarioBundleAsset = (scenarioId, assetKey, mode) => {
   };
 };
 
-const exportScenarioBundle = (scenarioId, { mode = "light" } = {}) => {
-  const summary = getScenarioSummary(scenarioId);
-  const details = getScenarioDetails(scenarioId);
+// Exporting only requires VISIBILITY (owner or shared) — getScenarioSummary/
+// getScenarioDetails already enforce that via the filtered catalog, so
+// threading userId through them is the entire guard here.
+const exportScenarioBundle = (userId, scenarioId, { mode = "light" } = {}) => {
+  const summary = getScenarioSummary(userId, scenarioId);
+  const details = getScenarioDetails(userId, scenarioId);
 
   return {
     assets: {
@@ -2022,7 +2192,8 @@ const exportScenarioBundle = (scenarioId, { mode = "light" } = {}) => {
   };
 };
 
-const importScenarioBundle = (bundle, { setSelected = true } = {}) => {
+const importScenarioBundle = (userId, bundle, { setSelected = true } = {}) => {
+  requireUserId(userId);
   ensureScenarioStore();
 
   if (!bundle || typeof bundle !== "object") {
@@ -2037,7 +2208,9 @@ const importScenarioBundle = (bundle, { setSelected = true } = {}) => {
   const data = bundle.data && typeof bundle.data === "object" ? bundle.data : {};
   const assets = bundle.assets && typeof bundle.assets === "object" ? bundle.assets : {};
 
-  const created = createScenario({
+  // Imports always create a brand-new scenario owned by `userId` — there is
+  // no existing-scenario visibility concern here.
+  const created = createScenario(userId, {
     accentColor: scenario.accentColor,
     countryNameOverrides: scenario.countryNameOverrides,
     description: scenario.description,
@@ -2052,7 +2225,7 @@ const importScenarioBundle = (bundle, { setSelected = true } = {}) => {
 
   const scenarioId = created.scenario.id;
 
-  updateScenario(scenarioId, {
+  updateScenario(userId, scenarioId, {
     game: data.game ?? {},
     prompts: data.prompts ?? {},
     storage: {
@@ -2103,10 +2276,10 @@ const importScenarioBundle = (bundle, { setSelected = true } = {}) => {
   writeScenarioMeta(scenarioId, {});
 
   if (setSelected) {
-    setSelectedScenario(scenarioId);
+    setSelectedScenario(userId, scenarioId);
   }
 
-  return getScenarioDetails(scenarioId);
+  return getScenarioDetails(userId, scenarioId);
 };
 
 export {
