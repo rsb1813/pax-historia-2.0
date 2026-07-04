@@ -15,6 +15,7 @@ server/data/*
 !server/data/scenarios/
 .key
 certs/
+server/secrets/
 
 # Editor directories and files
 .vscode/*
