@@ -60,6 +60,16 @@ This is a personal fork ([`rsb1813/open-paxhistoria`](https://github.com/rsb1813
 - **Installable as a PWA** — the app can be installed as a standalone app. Works out of the box from
   `localhost`; installing from other devices on the LAN needs a self-signed HTTPS cert (see
   [Installing the app (PWA) on other devices](#installing-the-app-pwa-on-other-devices)).
+- **Accounts, server-side settings, and encrypted AI keys** — the first person to open the app creates
+  the owner account (email + password); after that, new accounts are invite-only (added from Settings
+  once signed in — there's no public sign-up). Map/display settings, AI provider choice, and API keys
+  now live on the server per account (API keys encrypted at rest) instead of only in one browser, so
+  they follow you across devices. Existing browser-only settings/keys are offered for one-time import
+  on first login. `node scripts/reset-password.mjs <email> <newPassword>` resets a password from the
+  command line if you're ever locked out.
+
+This fork is meant for personal/self-hosted use (yourself, family, friends on your own server) — it
+isn't set up or intended for public deployment.
 
 ---
 
@@ -131,7 +141,8 @@ npm run build          # Build the client
 node server/server.js  # Start the server
 ```
 
-Then open **http://localhost:3000** in your browser.
+Then open **http://localhost:3000** in your browser. The first visit asks you to create the owner
+account (email + password) — after that, sign in with it every time.
 
 > **Note:** the large map assets (`*.pmtiles`, `public/assets/*-seed.*`, and
 > `server/data/scenarios/default/regions.geojson`) live in Git LFS. If you downloaded a
