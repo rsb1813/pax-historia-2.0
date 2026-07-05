@@ -1,6 +1,16 @@
 /*! Open Historia — portions (troop & era prompt additions) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
 const normalizeString = (value) => String(value ?? "").trim();
 
+// Per-mechanism AI provider/model override — blank fields mean "use the
+// account's global default provider/model" (see providerConfig.js).
+const normalizeModelOverride = (value) => {
+  const raw = value && typeof value === "object" ? value : {};
+  return {
+    model: normalizeString(raw.model),
+    provider: normalizeString(raw.provider),
+  };
+};
+
 const PROMPT_ADVISOR_DEFAULT = `You are a senior strategic advisor to the leader of \${PLAYER_POLITY}.
 Current date: \${ORIGIN_ROUND_DATE}
 Starting date: \${STARTING_ROUND_DATE}
@@ -121,6 +131,36 @@ History: \${CATALYST_SIMULATION_HISTORY}
 
 Return JSON only:
 {"title":"","description":"","importance":"major"}`,
+  countryBriefing: `You are the intelligence advisor in an alternate-history strategy game.
+Current date: \${ORIGIN_ROUND_DATE}
+Player polity: \${PLAYER_POLITY}
+Target polity: \${TARGET_POLITY}
+Language: \${language}
+Simulation rules: \${HISTORICAL_PRESET_SIMULATION_RULES}
+World snapshot: \${GRAND_MAP_DESCRIPTION}
+Recent events: \${PREVIOUS_ROUND_EVENTS}
+Target dossier: \${TARGET_DOSSIER}
+
+Treat the target dossier and world snapshot as ground truth. Where specifics are not recorded, give your best historical estimate for this era, people and region - you are the advisor, and plausible estimates are your job. Never answer with "unknown", "no data" or "not specified"; mark guesses with "(est.)" instead.
+
+Cover government/leadership, territory & key regions, military strength, economy, and diplomatic posture toward \${PLAYER_POLITY}.
+
+Respond in \${language} as 4-6 short bullet points, each prefixed with "- ". No preamble, no closing remarks.`,
+  countryStatSheet: `You are the statistics bureau of an alternate-history strategy game.
+Current date: \${ORIGIN_ROUND_DATE}
+Target polity: \${TARGET_POLITY}
+Language: \${language}
+Simulation rules: \${HISTORICAL_PRESET_SIMULATION_RULES}
+World snapshot: \${GRAND_MAP_DESCRIPTION}
+Recent events: \${PREVIOUS_ROUND_EVENTS}
+Target dossier: \${TARGET_DOSSIER}
+
+Compile a national stat sheet for the target polity. Treat the target dossier and world snapshot as ground truth; where specifics are not recorded, give your best historical estimate for this era, people and region - never refuse, never say unknown. Money units must fit the era (barter/tribute-era polities still get best-effort figures).
+
+Return JSON only:
+{"capital":"city","continent":"continent","government":"system · ideology","leader":"head of state/government","stability":0-100 integer,"indices":{"sovereignty":0-100,"foodAutonomy":0-100,"energyAutonomy":0-100,"economicIndependence":0-100,"internalSecurity":0-100},"economy":{"gdp":"9 B$","gdpGrowth":"+5.2% / yr","gdpPerCapita":"796 $","currency":"XOF","inflation":"0.3%","unemployment":"1%","publicDebt":"47.5% GDP","budgetBalance":"-3.7% GDP"},"gdpBreakdown":{"agriculture":24,"industry":24,"services":52}}
+
+gdpBreakdown percentages must sum to 100. Write text values in \${language}; keep numbers plain.`,
   descriptionToAction: `You convert a raw player intent into one structured in-game command.
 Player polity: \${PLAYER_POLITY}
 Current date: \${ORIGIN_ROUND_DATE}
@@ -233,6 +273,8 @@ export const PROMPT_HELPER_DEFAULTS = {
   RUNNING_CATALYST_DATE: "${catalystDate}",
   RUNNING_CATALYST_PERCENT: "${catalystPercent}",
   STARTING_ROUND_DATE: "${startDate}",
+  TARGET_DOSSIER: "${targetDossier}",
+  TARGET_POLITY: "${targetPolity}",
   TARGET_ROUND_DATE: "${targetDate}",
   TARGET_ROUND_GRAMMATICAL_DATE: "${targetDateReadable}",
   THIS_CHATS_MOST_RECENT_SPEAKER: "${lastSpeaker}",
@@ -414,6 +456,35 @@ export const PROMPT_SECTION_DEFINITIONS = [
     label: "Game Master",
     type: "task",
   },
+  {
+    description: "Freeform intelligence briefing bullets for a selected country/polity.",
+    helpers: [
+      "PLAYER_POLITY",
+      "TARGET_POLITY",
+      "TARGET_DOSSIER",
+      "HISTORICAL_PRESET_SIMULATION_RULES",
+      "GRAND_MAP_DESCRIPTION",
+      "PREVIOUS_ROUND_EVENTS",
+      "ORIGIN_ROUND_DATE",
+    ],
+    key: "countryBriefing",
+    label: "Country Briefing",
+    type: "task",
+  },
+  {
+    description: "Structured national stat sheet (JSON) for the Stats tab.",
+    helpers: [
+      "TARGET_POLITY",
+      "TARGET_DOSSIER",
+      "HISTORICAL_PRESET_SIMULATION_RULES",
+      "GRAND_MAP_DESCRIPTION",
+      "PREVIOUS_ROUND_EVENTS",
+      "ORIGIN_ROUND_DATE",
+    ],
+    key: "countryStatSheet",
+    label: "Country Stat Sheet",
+    type: "task",
+  },
 ];
 
 export const PROMPT_SECTION_BY_KEY = Object.fromEntries(
@@ -422,10 +493,15 @@ export const PROMPT_SECTION_BY_KEY = Object.fromEntries(
 
 export const PROMPT_TASK_KEYS = Object.keys(PROMPT_TASK_DEFAULTS);
 
+// Every editable mechanism (the 2 root chats + 12 tasks) can carry its own
+// provider/model override, keyed the same as PROMPT_SECTION_DEFINITIONS.
+const PROMPT_MODEL_SECTION_KEYS = PROMPT_SECTION_DEFINITIONS.map((section) => section.key);
+
 export const normalizePromptPack = (rawPrompts) => {
   const prompts = rawPrompts && typeof rawPrompts === "object" ? rawPrompts : {};
   const tasks = prompts.tasks && typeof prompts.tasks === "object" ? prompts.tasks : {};
   const helpers = prompts.helpers && typeof prompts.helpers === "object" ? prompts.helpers : {};
+  const models = prompts.models && typeof prompts.models === "object" ? prompts.models : {};
 
   return {
     advisor: normalizeString(prompts.advisor) || PROMPT_ADVISOR_DEFAULT,
@@ -436,6 +512,9 @@ export const normalizePromptPack = (rawPrompts) => {
       ]),
     ),
     leader: normalizeString(prompts.leader) || PROMPT_LEADER_DEFAULT,
+    models: Object.fromEntries(
+      PROMPT_MODEL_SECTION_KEYS.map((key) => [key, normalizeModelOverride(models[key])]),
+    ),
     tasks: Object.fromEntries(
       PROMPT_TASK_KEYS.map((key) => [
         key,
@@ -452,6 +531,7 @@ export const serializePromptPack = (rawPack) => {
     advisor: pack.advisor,
     helpers: pack.helpers,
     leader: pack.leader,
+    models: pack.models,
     tasks: pack.tasks,
     ...pack.tasks,
   };

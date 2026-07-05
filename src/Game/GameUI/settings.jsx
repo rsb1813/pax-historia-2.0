@@ -19,6 +19,13 @@ import {
     getMapSetting,
     setMapSetting,
 } from "../../runtime/mapSettings.js";
+import { JSON_URLS, readJson, writeJson } from "../../runtime/assets.js";
+import {
+    PROMPT_SECTION_DEFINITIONS,
+    normalizePromptPack,
+    serializePromptPack,
+} from "../AI/gameplayPrompts.js";
+import { refreshPromptCatalog } from "../AI/main.jsx";
 
 const baseStyle = {
     position: "fixed",
@@ -653,6 +660,354 @@ const ProviderSettingsPanel = ({ provider, settings, onSettingChange }) => {
     );
 };
 
+const PROMPT_EDITOR_SPINNER_STYLE_ID = "prompt-editor-spinner-style";
+
+const ensurePromptEditorSpinnerStyle = () => {
+    if (typeof document === "undefined" || document.getElementById(PROMPT_EDITOR_SPINNER_STYLE_ID)) {
+        return;
+    }
+
+    const style = document.createElement("style");
+    style.id = PROMPT_EDITOR_SPINNER_STYLE_ID;
+    style.textContent = `
+    @keyframes prompt-editor-spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+    }
+    `;
+    document.head.appendChild(style);
+};
+
+const PromptEditorSpinner = ({ size = 14 }) => {
+    useEffect(() => {
+        ensurePromptEditorSpinnerStyle();
+    }, []);
+
+    return (
+        <svg
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        aria-hidden="true"
+        style={{ animation: "prompt-editor-spin 0.7s linear infinite" }}
+        >
+        <circle cx="12" cy="12" r="8" stroke="rgba(255,255,255,0.2)" strokeWidth="2.2" />
+        <path d="M12 4a8 8 0 0 1 8 8" stroke="rgba(255,255,255,0.88)" strokeWidth="2.2" strokeLinecap="round" />
+        </svg>
+    );
+};
+
+const EMPTY_MODEL_OVERRIDE = { model: "", provider: "" };
+
+// Blanks the section's stored text (both the flat key normalizePromptPack
+// reads first and the nested tasks[key] it falls back to) and re-normalizes,
+// so the catalog's own default backfill (see gameplayPrompts.js) refills the
+// field with the exact built-in prompt — no separate default copy to keep in
+// sync here.
+const resetPackSection = (pack, section) => {
+    const raw = serializePromptPack(pack);
+    raw[section.key] = "";
+    if (section.type === "task") {
+        raw.tasks = { ...raw.tasks, [section.key]: "" };
+    }
+    return normalizePromptPack(raw);
+};
+
+const PromptEditorPanel = () => {
+    const [isOpen, setIsOpen] = useState(false);
+    const [pack, setPack] = useState(null);
+    const [sectionKey, setSectionKey] = useState(PROMPT_SECTION_DEFINITIONS[0]?.key ?? "");
+    const [loading, setLoading] = useState(false);
+    const [loadedOnce, setLoadedOnce] = useState(false);
+    const [saving, setSaving] = useState(false);
+    const [error, setError] = useState(null);
+    const [justSaved, setJustSaved] = useState(false);
+
+    useEffect(() => {
+        if (!isOpen || loadedOnce || loading) {
+            return;
+        }
+
+        setLoading(true);
+        setError(null);
+        readJson(JSON_URLS.prompts, { defaultValue: {} })
+            .then((data) => {
+                setPack(normalizePromptPack(data));
+                setLoadedOnce(true);
+            })
+            .catch((loadError) => {
+                console.error("Failed to load AI prompt settings:", loadError);
+                setError("Could not load the current prompts. Try reopening this panel.");
+            })
+            .finally(() => setLoading(false));
+    }, [isOpen, loadedOnce, loading]);
+
+    const currentSection =
+        PROMPT_SECTION_DEFINITIONS.find((section) => section.key === sectionKey) ?? PROMPT_SECTION_DEFINITIONS[0];
+    const currentValue = pack
+        ? currentSection.type === "root"
+            ? pack[currentSection.key]
+            : pack.tasks[currentSection.key]
+        : "";
+    const currentModel = pack?.models?.[currentSection.key] ?? EMPTY_MODEL_OVERRIDE;
+
+    const mutatePack = (updater) => {
+        setJustSaved(false);
+        setPack(updater);
+    };
+
+    const handlePromptChange = (value) => {
+        mutatePack((current) => {
+            if (!current) return current;
+            return currentSection.type === "root"
+                ? { ...current, [currentSection.key]: value }
+                : { ...current, tasks: { ...current.tasks, [currentSection.key]: value } };
+        });
+    };
+
+    const handleHelperChange = (helperKey, value) => {
+        mutatePack((current) =>
+            current ? { ...current, helpers: { ...current.helpers, [helperKey]: value } } : current);
+    };
+
+    const handleModelFieldChange = (field, value) => {
+        mutatePack((current) => {
+            if (!current) return current;
+            return {
+                ...current,
+                models: {
+                    ...current.models,
+                    [currentSection.key]: {
+                        ...(current.models?.[currentSection.key] ?? EMPTY_MODEL_OVERRIDE),
+                        [field]: value,
+                    },
+                },
+            };
+        });
+    };
+
+    const handleResetSection = () => {
+        mutatePack((current) => (current ? resetPackSection(current, currentSection) : current));
+    };
+
+    const handleSave = () => {
+        if (!pack) return;
+
+        setSaving(true);
+        setError(null);
+        writeJson(JSON_URLS.prompts, serializePromptPack(pack), { pretty: true })
+            .then(() => {
+                setJustSaved(true);
+                // The advisor/leader chat module caches its prompt pack for the
+                // life of the page — without this, an edited advisor/leader
+                // prompt or model override would silently keep using the old
+                // one until a full reload.
+                return refreshPromptCatalog();
+            })
+            .catch((saveError) => {
+                console.error("Failed to save AI prompt settings:", saveError);
+                setError("Could not save. Try again.");
+            })
+            .finally(() => setSaving(false));
+    };
+
+    return (
+        <div style={{ marginBottom: "1rem" }}>
+        <button
+        type="button"
+        onClick={() => setIsOpen((prev) => !prev)}
+        style={{
+            width: "100%",
+            padding: "0.8rem 0.9rem",
+            borderRadius: "10px",
+            border: "1px solid rgba(255,255,255,0.12)",
+            backgroundColor: "rgba(0,0,0,0.18)",
+            color: "white",
+            cursor: "pointer",
+            textAlign: "left",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: "0.75rem",
+        }}
+        >
+        <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: "0.9rem", fontWeight: 700 }}>AI Prompts &amp; Models</div>
+        <div style={{ marginTop: "0.2rem", fontSize: "0.72rem", color: "rgba(255,255,255,0.6)", lineHeight: 1.45 }}>
+        Edit the system prompt and model used for each AI mechanism.
+        </div>
+        </div>
+        <div style={{ fontSize: "0.85rem", color: "rgba(255,255,255,0.7)" }}>{isOpen ? "Hide" : "Open"}</div>
+        </button>
+
+        {isOpen && (
+            <div
+            style={{
+                marginTop: "0.7rem",
+                padding: "0.75rem",
+                borderRadius: "10px",
+                border: "1px solid rgba(255,255,255,0.1)",
+                backgroundColor: "rgba(255,255,255,0.04)",
+            }}
+            >
+            {loading && (
+                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", ...helperStyle, marginTop: 0 }}>
+                <PromptEditorSpinner />
+                Loading prompts...
+                </div>
+            )}
+
+            {!loading && pack && (
+                <>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "0.4rem", marginBottom: "0.75rem" }}>
+                {PROMPT_SECTION_DEFINITIONS.map((section) => (
+                    <button
+                    key={section.key}
+                    type="button"
+                    onClick={() => setSectionKey(section.key)}
+                    style={{
+                        padding: "0.35rem 0.7rem",
+                        borderRadius: "999px",
+                        border: "1px solid",
+                        borderColor: section.key === currentSection.key ? "rgba(59,130,246,0.8)" : "rgba(255,255,255,0.12)",
+                        backgroundColor: section.key === currentSection.key ? "rgba(59,130,246,0.22)" : "rgba(0,0,0,0.18)",
+                        color: "white",
+                        fontSize: "0.74rem",
+                        cursor: "pointer",
+                    }}
+                    >
+                    {section.label}
+                    </button>
+                ))}
+                </div>
+
+                <div style={{ ...helperStyle, marginTop: 0, marginBottom: "0.65rem" }}>
+                {currentSection.description}
+                </div>
+
+                <div style={fieldGroupStyle}>
+                <label style={labelStyle}>{currentSection.label} Prompt</label>
+                <textarea
+                value={currentValue}
+                onChange={(event) => handlePromptChange(event.target.value)}
+                rows={10}
+                autoComplete="off"
+                spellCheck={false}
+                style={{ ...inputStyle, fontFamily: "monospace", resize: "vertical" }}
+                />
+                </div>
+
+                <button
+                type="button"
+                onClick={handleResetSection}
+                style={{
+                    marginBottom: "0.85rem",
+                    padding: "0.4rem 0.7rem",
+                    borderRadius: "8px",
+                    border: "1px solid rgba(255,255,255,0.16)",
+                    backgroundColor: "rgba(255,255,255,0.06)",
+                    color: "white",
+                    fontSize: "0.76rem",
+                    cursor: "pointer",
+                }}
+                >
+                Reset this prompt to default
+                </button>
+
+                <div
+                style={{
+                    marginBottom: "0.85rem",
+                    padding: "0.65rem",
+                    borderRadius: "8px",
+                    border: "1px solid rgba(255,255,255,0.1)",
+                    backgroundColor: "rgba(0,0,0,0.12)",
+                }}
+                >
+                <div style={{ fontSize: "0.78rem", fontWeight: 700, marginBottom: "0.5rem" }}>
+                Model override for this mechanism
+                </div>
+                <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+                <select
+                value={currentModel.provider}
+                onChange={(event) => handleModelFieldChange("provider", event.target.value)}
+                style={{ ...inputStyle, flex: "1 1 10rem", cursor: "pointer" }}
+                >
+                <option value="">Use global default provider</option>
+                {PROVIDER_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value} style={{ color: "black" }}>
+                    {option.label}
+                    </option>
+                ))}
+                </select>
+                <input
+                type="text"
+                value={currentModel.model}
+                onChange={(event) => handleModelFieldChange("model", event.target.value)}
+                placeholder="Use global default model"
+                autoComplete="off"
+                spellCheck={false}
+                style={{ ...inputStyle, flex: "1 1 10rem" }}
+                />
+                </div>
+                <div style={{ ...helperStyle, marginBottom: 0 }}>
+                Leave both blank to use the account's default AI provider and model configured above.
+                </div>
+                </div>
+
+                <div style={{ display: "grid", gap: "0.6rem", marginBottom: "0.85rem" }}>
+                {currentSection.helpers.map((helperKey) => (
+                    <div key={helperKey}>
+                    <label style={labelStyle}>{helperKey}</label>
+                    <textarea
+                    value={pack.helpers[helperKey] ?? ""}
+                    onChange={(event) => handleHelperChange(helperKey, event.target.value)}
+                    rows={3}
+                    autoComplete="off"
+                    spellCheck={false}
+                    style={{ ...inputStyle, fontFamily: "monospace", resize: "vertical" }}
+                    />
+                    </div>
+                ))}
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
+                <button
+                type="button"
+                onClick={handleSave}
+                disabled={saving}
+                style={{
+                    padding: "0.55rem 0.9rem",
+                    borderRadius: "8px",
+                    border: "none",
+                    backgroundColor: "#3b82f6",
+                    color: "white",
+                    fontWeight: 700,
+                    fontSize: "0.82rem",
+                    cursor: saving ? "default" : "pointer",
+                    opacity: saving ? 0.7 : 1,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "0.4rem",
+                }}
+                >
+                {saving && <PromptEditorSpinner size={12} />}
+                {saving ? "Saving..." : "Save prompts"}
+                </button>
+                {!saving && justSaved && (
+                    <span style={{ fontSize: "0.76rem", color: "#4ade80" }}>Saved.</span>
+                )}
+                </div>
+                </>
+            )}
+
+            {error && <div style={{ ...helperStyle, color: "#f87171", marginTop: "0.6rem" }}>{error}</div>}
+            </div>
+        )}
+        </div>
+    );
+};
+
 const SocialLinks = ({ discordUrl, githubUrl }) => (
     <div
     style={{
@@ -835,6 +1190,8 @@ const SettingsMenu = ({
         settings={providerSettings ?? {}}
         onSettingChange={onProviderSettingChange ?? (() => {})}
         />
+
+        <PromptEditorPanel />
 
         <LanguageSelector />
 

@@ -3,6 +3,7 @@ import {
     getProviderSettings,
     getReasoningEnabled,
     getStoredProvider,
+    normalizeProvider,
     providerSupportsModelDiscovery,
     setProviderField,
 } from "./providerConfig.js";
@@ -209,7 +210,12 @@ function toAnthropicMessages(history) {
     }));
 }
 
-async function resolveModel(provider, { endpoint = "", authProvider = null, fallbackModel = "", providerLabel } = {}) {
+async function resolveModel(provider, { endpoint = "", authProvider = null, fallbackModel = "", providerLabel, overrideModel = "" } = {}) {
+    const trimmedOverride = (overrideModel ?? "").trim();
+    if (trimmedOverride) {
+        return provider === "gemini" ? normalizeGeminiModel(trimmedOverride) : trimmedOverride;
+    }
+
     const settings = getProviderSettings(provider);
     const configuredModel = settings.model.trim();
 
@@ -255,7 +261,7 @@ async function resolveModel(provider, { endpoint = "", authProvider = null, fall
     }
 }
 
-async function callGemini(systemPrompt, history, { retries = 3, retryDelay = 15000 } = {}) {
+async function callGemini(systemPrompt, history, { retries = 3, retryDelay = 15000, modelOverride = "" } = {}) {
     const apiKey = await revealProviderApiKey("gemini");
 
     if (!apiKey) {
@@ -266,6 +272,7 @@ async function callGemini(systemPrompt, history, { retries = 3, retryDelay = 150
     const model = await resolveModel("gemini", {
         fallbackModel: GEMINI_DEFAULT_MODEL,
         providerLabel: "Gemini",
+        overrideModel: modelOverride,
     });
 
     const customParams = parseCustomParams(settings.customParams, "Gemini");
@@ -380,6 +387,7 @@ async function callOpenAI(systemPrompt, history, opts = {}) {
         endpoint: OPENAI_API_ENDPOINT,
         authProvider: "openai",
         providerLabel: "OpenAI",
+        overrideModel: opts.modelOverride,
     });
 
     return callOpenAIStyleChatCompletions({
@@ -410,6 +418,7 @@ async function callOpenAICompatible(systemPrompt, history, opts = {}) {
         endpoint,
         authProvider,
         providerLabel: "OpenAI Compatible",
+        overrideModel: opts.modelOverride,
     });
 
     return callOpenAIStyleChatCompletions({
@@ -424,7 +433,7 @@ async function callOpenAICompatible(systemPrompt, history, opts = {}) {
     });
 }
 
-async function callAnthropic(systemPrompt, history, { retries = 3, retryDelay = 15000 } = {}) {
+async function callAnthropic(systemPrompt, history, { retries = 3, retryDelay = 15000, modelOverride = "" } = {}) {
     if (!hasProviderApiKey("anthropic")) {
         throw new Error("Go to **settings** and paste your Anthropic API key.");
     }
@@ -434,6 +443,7 @@ async function callAnthropic(systemPrompt, history, { retries = 3, retryDelay = 
     const model = await resolveModel("anthropic", {
         fallbackModel: ANTHROPIC_DEFAULT_MODEL,
         providerLabel: "Anthropic",
+        overrideModel: modelOverride,
     });
 
     // A custom endpoint is a self-hosted proxy — it can't be assumed to send the
@@ -506,7 +516,12 @@ async function callAnthropic(systemPrompt, history, { retries = 3, retryDelay = 
     }
 }
 
-export async function callAI(systemPrompt, history, opts) {
+// overrides ({ provider, model }) lets a caller pin one AI call to a specific
+// provider/model instead of the account's global default (see the per-task
+// "models" map in gameplayPrompts.js normalizePromptPack). Both fields are
+// optional — a blank/missing provider falls back to getStoredProvider(), and
+// a blank/missing model falls back to that provider's own configured model.
+export async function callAI(systemPrompt, history, opts, overrides) {
     // Non-English players get replies in their language at the source —
     // native answers beat post-translating them (see runtime/i18n.js).
     const directive = languageDirective();
@@ -514,16 +529,19 @@ export async function callAI(systemPrompt, history, opts) {
         systemPrompt = `${systemPrompt}\n\n${directive}`;
     }
 
-    switch (getStoredProvider()) {
+    const provider = overrides?.provider ? normalizeProvider(overrides.provider) : getStoredProvider();
+    const callOpts = overrides?.model ? { ...opts, modelOverride: overrides.model } : opts;
+
+    switch (provider) {
     case "openai":
-        return callOpenAI(systemPrompt, history, opts);
+        return callOpenAI(systemPrompt, history, callOpts);
     case "anthropic":
-        return callAnthropic(systemPrompt, history, opts);
+        return callAnthropic(systemPrompt, history, callOpts);
     case "openai-compatible":
-        return callOpenAICompatible(systemPrompt, history, opts);
+        return callOpenAICompatible(systemPrompt, history, callOpts);
     case "gemini":
     default:
-        return callGemini(systemPrompt, history, opts);
+        return callGemini(systemPrompt, history, callOpts);
     }
 }
 
@@ -592,6 +610,17 @@ async function ensurePromptsLoaded() {
     }
 
     await promptsReady;
+}
+
+// ensurePromptsLoaded only ever fetches once per page load — after that,
+// promptPack is served from module memory even though writeJson() already
+// primed the underlying asset cache with a newer value. The settings prompt
+// editor calls this right after a successful save so an edited advisor/leader
+// prompt or model override takes effect on the very next chat message instead
+// of requiring a full page reload.
+export async function refreshPromptCatalog() {
+    promptsReady = null;
+    await ensurePromptsLoaded();
 }
 
 function buildChatHistoryText(chats) {
@@ -783,7 +812,7 @@ export async function sendMessage(userMessage, opts) {
     advisorHistory.push({ role: "user", parts: [{ text: userMessage }] });
 
     try {
-        const reply = await callAI(systemPrompt, advisorHistory, opts);
+        const reply = await callAI(systemPrompt, advisorHistory, opts, promptPack.models?.advisor);
         advisorHistory.push({ role: "model", parts: [{ text: reply }] });
         return reply;
     } catch (err) {
@@ -842,7 +871,7 @@ export async function sendDiplomaticMessage(playerMessage, speakingAs, countries
     ];
 
     try {
-        const raw = await callAI(freshPrompt, historyWithInstruction, opts);
+        const raw = await callAI(freshPrompt, historyWithInstruction, opts, promptPack.models?.leader);
         const { reply, reaction } = parseReaction(raw);
         diplomaticHistory.push({ role: "model", parts: [{ text: `[${speakingAs}]: ${reply}` }] });
         return { reply, reaction };

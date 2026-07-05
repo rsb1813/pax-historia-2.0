@@ -571,7 +571,7 @@ const runJsonTask = async (taskKey, { fallback, timeoutMs = 120000, userMessage,
 
   try {
     const raw = await withTimeout(
-      callAI(systemPrompt, [{ role: "user", parts: [{ text: userMessage }] }]),
+      callAI(systemPrompt, [{ role: "user", parts: [{ text: userMessage }] }], undefined, prompts.models?.[taskKey]),
       timeoutMs,
       `AI task "${taskKey}" timed out.`,
     );
@@ -1074,26 +1074,24 @@ export const generateCountryStats = async ({ code, name } = {}) => {
   const bundle = await readGameStateBundle({ force: true });
   const variables = await buildTemplateVariables(bundle);
   const target = name || code || "the polity";
-  const playerPolity = variables.playerPolity || bundle?.game?.country || "the player";
   const dossier = await buildTargetDossier(bundle, normalizeString(code));
-  const era = normalizeString(bundle.world?.simulationRules).slice(0, 700);
-  const system =
-    `You are the intelligence advisor in an alternate-history strategy game. ` +
-    `The current date is ${variables.date || "unknown"}. The player leads ${playerPolity}. ` +
-    `Give a concise intelligence briefing on ${target}${code ? ` (code ${code})` : ""}. ` +
-    `Treat the TARGET DOSSIER and WORLD STATE below as ground truth. Where specifics are not recorded, ` +
-    `give your best historical estimate for this era, people and region — you are the advisor, and ` +
-    `plausible estimates are your job. Never answer with "unknown", "no data" or "not specified"; ` +
-    `mark guesses with "(est.)" instead. ` +
-    `Cover government/leadership, territory & key regions, military strength, economy, and diplomatic posture toward ${playerPolity}.\n\n` +
-    (era ? `ERA & WORLD RULES:\n${era}\n\n` : "") +
-    `TARGET DOSSIER:\n${dossier || "(nothing recorded)"}\n\n` +
-    `WORLD STATE:\n${variables.worldSummary || variables.grandMapDescription || "(no summary)"}\n\n` +
-    `RECENT EVENTS:\n${variables.recentEvents || "(none)"}\n\n` +
-    `Respond in ${variables.language || "English"} as 4-6 short bullet points, each prefixed with "- ". No preamble, no closing remarks.`;
-  const raw = await callAI(system, [
-    { role: "user", parts: [{ text: `Give me the intelligence briefing on ${target}.` }] },
-  ]);
+  const prompts = await loadPromptCatalog();
+  const taskVariables = {
+    ...variables,
+    targetDossier: dossier || "(nothing recorded)",
+    targetPolity: `${target}${code ? ` (code ${code})` : ""}`,
+  };
+  const helperValues = resolveHelperValues(prompts.helpers, taskVariables);
+  const systemPrompt = renderTemplate(prompts.tasks.countryBriefing, {
+    ...taskVariables,
+    ...helperValues,
+  });
+  const raw = await callAI(
+    systemPrompt,
+    [{ role: "user", parts: [{ text: `Give me the intelligence briefing on ${target}.` }] }],
+    undefined,
+    prompts.models?.countryBriefing,
+  );
   return String(raw || "").trim();
 };
 
@@ -1104,30 +1102,23 @@ export const generateCountryStatSheet = async ({ code, name } = {}) => {
   const variables = await buildTemplateVariables(bundle);
   const target = name || code || "the polity";
   const dossier = await buildTargetDossier(bundle, normalizeString(code));
-  const era = normalizeString(bundle.world?.simulationRules).slice(0, 700);
-  const system =
-    `You are the statistics bureau of an alternate-history strategy game. ` +
-    `The current date is ${variables.date || "unknown"}. ` +
-    `Compile a national stat sheet for ${target}${code ? ` (code ${code})` : ""}. ` +
-    `Treat the TARGET DOSSIER and WORLD STATE below as ground truth; where specifics are not recorded, ` +
-    `give your best historical estimate for this era, people and region — never refuse, never say unknown. ` +
-    `Money units must fit the era (barter/tribute-era polities still get best-effort figures).\n\n` +
-    (era ? `ERA & WORLD RULES:\n${era}\n\n` : "") +
-    `TARGET DOSSIER:\n${dossier || "(nothing recorded)"}\n\n` +
-    `WORLD STATE:\n${variables.worldSummary || "(no summary)"}\n\n` +
-    `RECENT EVENTS:\n${variables.recentEvents || "(none)"}\n\n` +
-    `Respond with ONLY a JSON object — no prose, no markdown fences — exactly this shape:\n` +
-    `{"capital":"city","continent":"continent","government":"system · ideology","leader":"head of state/government",` +
-    `"stability":0-100 integer,` +
-    `"indices":{"sovereignty":0-100,"foodAutonomy":0-100,"energyAutonomy":0-100,"economicIndependence":0-100,"internalSecurity":0-100},` +
-    `"economy":{"gdp":"9 B$","gdpGrowth":"+5.2% / yr","gdpPerCapita":"796 $","currency":"XOF",` +
-    `"inflation":"0.3%","unemployment":"1%","publicDebt":"47.5% GDP","budgetBalance":"-3.7% GDP"},` +
-    `"gdpBreakdown":{"agriculture":24,"industry":24,"services":52}}\n` +
-    `gdpBreakdown percentages must sum to 100. ` +
-    `Write text values in ${variables.language || "English"}; keep numbers plain.`;
-  const raw = await callAI(system, [
-    { role: "user", parts: [{ text: `Compile the national stat sheet for ${target}.` }] },
-  ]);
+  const prompts = await loadPromptCatalog();
+  const taskVariables = {
+    ...variables,
+    targetDossier: dossier || "(nothing recorded)",
+    targetPolity: `${target}${code ? ` (code ${code})` : ""}`,
+  };
+  const helperValues = resolveHelperValues(prompts.helpers, taskVariables);
+  const systemPrompt = renderTemplate(prompts.tasks.countryStatSheet, {
+    ...taskVariables,
+    ...helperValues,
+  });
+  const raw = await callAI(
+    systemPrompt,
+    [{ role: "user", parts: [{ text: `Compile the national stat sheet for ${target}.` }] }],
+    undefined,
+    prompts.models?.countryStatSheet,
+  );
   const parsed = extractJsonPayload(raw);
   if (!parsed || typeof parsed !== "object") {
     throw new Error("The stat sheet did not come back as valid JSON.");
