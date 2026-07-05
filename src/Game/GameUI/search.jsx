@@ -1,74 +1,77 @@
 /*! Open Historia — portions (mobile search layout) © 2026 Nicholas Krol, MIT (see src/Editor/LICENSE). */
 import React, { memo, useEffect, useRef, useState } from "react";
 import { useIsMobile } from "../../runtime/useIsMobile.js";
+import { loadCountryNames, loadRegionCatalog } from "../../runtime/assets.js";
+import { focusMapOnBounds, loadCountryBounds, loadRegionBounds } from "../../runtime/mapBounds.js";
+import { flagEmojiFromGid, flagImageUrlFromGid } from "../../runtime/countryFlags.js";
+import { openCountryPanel } from "../Selection/CountryPanel.jsx";
+import { searchSeedCities } from "../../Editor/citiesImport.js";
 
-const SEARCH_HEADERS = { "Accept-Language": "en, *;q=0.5" };
-const SEARCH_RESULT_CACHE = new Map();
+// Per-type result caps: no single catalog should crowd out the others, and
+// the dropdown isn't scrollable, so the merged total stays small too.
+const TYPE_LIMIT = 3;
+const TOTAL_LIMIT = 6;
 
-const formatSuggestion = (suggestion) => {
-  const address = suggestion.address || {};
-
-  const primary =
-    suggestion.namedetails?.["name:en"] ||
-    address.amenity ||
-    address.tourism ||
-    address.leisure ||
-    address.suburb ||
-    address.neighbourhood ||
-    address.city ||
-    address.town ||
-    address.village ||
-    address.municipality ||
-    address.county ||
-    suggestion.display_name.split(",")[0].trim();
-
-  const region = [address.state || address.region, address.country]
-    .filter(Boolean)
-    .join(", ");
-
-  return { primary, region };
+// Same idiom as the map editor's searchSeedCities: prefix matches rank above
+// substring matches. Country/region catalogs carry no population to break
+// ties on, so within a bucket they keep the catalog's own (alphabetical) order.
+const rankByPrefix = (items, query, limit, getName) => {
+  const starts = [];
+  const contains = [];
+  for (const item of items) {
+    const name = String(getName(item) || "").toLowerCase();
+    if (!name) continue;
+    if (name.startsWith(query)) starts.push(item);
+    else if (name.includes(query)) contains.push(item);
+  }
+  return [...starts, ...contains].slice(0, limit);
 };
 
-const dedup = (results) => {
-  const seen = new Set();
-  return results.filter((suggestion) => {
-    const { primary, region } = formatSuggestion(suggestion);
-    const key = `${primary}|${region}`.toLowerCase();
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-};
+const toCountrySuggestion = (entry) => ({
+  type: "country",
+  key: `country:${entry.code || entry.name}`,
+  primary: entry.name,
+  region: "",
+  code: entry.code,
+});
 
-const buildSearchParams = (query, limit) =>
-  new URLSearchParams({
-    q: query,
-    format: "json",
-    limit: String(limit),
-    addressdetails: "1",
-    namedetails: "1",
-    "accept-language": "en",
-    accept_language: "en",
-  });
+const toRegionSuggestion = (entry) => ({
+  type: "region",
+  key: `region:${entry.id}`,
+  primary: entry.name,
+  region: entry.country || "",
+  id: entry.id,
+});
 
-const fetchPlaces = async (query, limit, { signal } = {}) => {
-  const trimmedQuery = query.trim();
-  const cacheKey = `${trimmedQuery.toLowerCase()}::${limit}`;
-  if (SEARCH_RESULT_CACHE.has(cacheKey)) {
-    return SEARCH_RESULT_CACHE.get(cacheKey);
-  }
+const toCitySuggestion = (entry) => ({
+  type: "city",
+  key: `city:${entry.name}:${entry.coord?.[0]}:${entry.coord?.[1]}`,
+  primary: entry.name,
+  region: entry.country || "",
+  coord: entry.coord,
+});
 
-  const response = await fetch(
-    `https://nominatim.openstreetmap.org/search?${buildSearchParams(trimmedQuery, limit)}`,
-    { headers: SEARCH_HEADERS, signal },
-  );
-  if (!response.ok) {
-    throw new Error(`Search failed: HTTP ${response.status}`);
-  }
-  const data = await response.json();
-  const results = dedup(data).slice(0, limit);
-  SEARCH_RESULT_CACHE.set(cacheKey, results);
-  return results;
+// Three in-game catalogs, not a real-world geocoder: countries/regions come
+// from the active scenario's own name catalogs (era overrides win), cities
+// come from the map editor's modern-world seed index (no era-correct city
+// catalog exists yet, so this is an approximate stand-in — see search.jsx
+// integration notes).
+const searchGameWorld = async (query) => {
+  const trimmed = query.trim();
+  const q = trimmed.toLowerCase();
+  if (!q) return [];
+
+  const [countries, regions, cities] = await Promise.all([
+    loadCountryNames().catch(() => []),
+    loadRegionCatalog().catch(() => []),
+    searchSeedCities(trimmed, TYPE_LIMIT).catch(() => []),
+  ]);
+
+  const countryMatches = rankByPrefix(countries, q, TYPE_LIMIT, (c) => c.name).map(toCountrySuggestion);
+  const regionMatches = rankByPrefix(regions, q, TYPE_LIMIT, (r) => r.name).map(toRegionSuggestion);
+  const cityMatches = cities.map(toCitySuggestion);
+
+  return [...countryMatches, ...regionMatches, ...cityMatches].slice(0, TOTAL_LIMIT);
 };
 
 const ICON_GLOBE = (
@@ -131,15 +134,13 @@ const ICON_REGION = (
   </svg>
 );
 
-const getIcon = (suggestion) => {
-  const type = suggestion.type || suggestion.addresstype || "";
-  const kind = suggestion.class || "";
-  if (type === "country" || suggestion.addresstype === "country") return ICON_GLOBE;
-  if (["state", "region", "province"].includes(type)) return ICON_REGION;
-  if (["city", "town", "village", "municipality", "borough"].includes(type)) return ICON_CITY;
-  if (kind === "place") return ICON_CITY;
-  return ICON_PIN;
+const ICON_BY_TYPE = {
+  country: ICON_GLOBE,
+  region: ICON_REGION,
+  city: ICON_CITY,
 };
+
+const getIcon = (suggestion) => ICON_BY_TYPE[suggestion.type] || ICON_PIN;
 
 const Search = memo(({ mapRef }) => {
   const isMobile = useIsMobile();
@@ -162,6 +163,7 @@ const Search = memo(({ mapRef }) => {
     if (!query.trim() || query.length < 2) {
       clearTimeout(debounceRef.current);
       searchAbortRef.current?.abort();
+      searchAbortRef.current = null;
       setSuggestions([]);
       setSelectedIndex(-1);
       return undefined;
@@ -173,15 +175,21 @@ const Search = memo(({ mapRef }) => {
     debounceRef.current = setTimeout(async () => {
       const controller = new AbortController();
       searchAbortRef.current = controller;
+      // The city catalog is a 7.5MB seed file lazy-fetched on first use (see
+      // searchSeedCities) — show the spinner so that first search isn't a
+      // silently-dead box while it downloads.
+      setStatus("loading");
 
       try {
-        const results = await fetchPlaces(query, 5, { signal: controller.signal });
+        const results = await searchGameWorld(query);
         if (searchAbortRef.current !== controller) return;
         setSuggestions(results);
         setSelectedIndex(-1);
+        setStatus(null);
       } catch (error) {
         if (controller.signal.aborted) return;
         setSuggestions([]);
+        setStatus(null);
       }
     }, 200);
 
@@ -194,6 +202,7 @@ const Search = memo(({ mapRef }) => {
   const close = () => {
     clearTimeout(debounceRef.current);
     searchAbortRef.current?.abort();
+    searchAbortRef.current = null;
     setExpanded(false);
     setQuery("");
     setStatus(null);
@@ -201,18 +210,45 @@ const Search = memo(({ mapRef }) => {
     setSelectedIndex(-1);
   };
 
-  const flyToResult = (result) => {
+  // Countries/regions jump via a bounding-box fitBounds (like the event-ticker
+  // camera); cities are a single point, so a flyTo is enough. Only countries
+  // have a click-independent selection entry point (openCountryPanel) — a
+  // region result therefore moves the camera but doesn't select/highlight it,
+  // and city results have no selection concept in this UI at all.
+  const selectResult = async (suggestion) => {
     const map = mapRef?.current;
-    if (map) {
-      map.flyTo({
-        center: [Number.parseFloat(result.lon), Number.parseFloat(result.lat)],
-        zoom: 5,
-        duration: 1800,
-        essential: true,
-      });
+
+    if (suggestion.type === "city") {
+      if (map && suggestion.coord) {
+        map.flyTo({ center: suggestion.coord, zoom: 5, duration: 1800, essential: true });
+      }
+      close();
+      return;
     }
 
-    close();
+    setStatus("loading");
+    setSuggestions([]);
+
+    try {
+      const bounds = suggestion.type === "country"
+        ? (await loadCountryBounds()).get(suggestion.code)
+        : (await loadRegionBounds()).get(suggestion.id);
+
+      focusMapOnBounds(mapRef, bounds || null);
+
+      if (suggestion.type === "country") {
+        openCountryPanel({
+          code: suggestion.code,
+          name: suggestion.primary,
+          flagUrl: flagImageUrlFromGid(suggestion.code),
+          flagEmoji: flagEmojiFromGid(suggestion.code),
+        });
+      }
+
+      close();
+    } catch {
+      setStatus("error");
+    }
   };
 
   const flyTo = async (place) => {
@@ -220,13 +256,13 @@ const Search = memo(({ mapRef }) => {
     setSuggestions([]);
 
     try {
-      const [result] = await fetchPlaces(place, 1);
+      const [result] = await searchGameWorld(place);
       if (!result) {
         setStatus("error");
         return;
       }
 
-      flyToResult(result);
+      await selectResult(result);
     } catch {
       setStatus("error");
     }
@@ -252,7 +288,7 @@ const Search = memo(({ mapRef }) => {
 
     if (event.key === "Enter") {
       if (selectedIndex >= 0 && suggestions[selectedIndex]) {
-        flyToResult(suggestions[selectedIndex]);
+        selectResult(suggestions[selectedIndex]);
       } else if (query.trim()) {
         flyTo(query.trim());
       }
@@ -261,7 +297,7 @@ const Search = memo(({ mapRef }) => {
 
   const commit = () => {
     if (selectedIndex >= 0 && suggestions[selectedIndex]) {
-      flyToResult(suggestions[selectedIndex]);
+      selectResult(suggestions[selectedIndex]);
     } else if (query.trim()) {
       flyTo(query.trim());
     }
@@ -416,14 +452,14 @@ const Search = memo(({ mapRef }) => {
           }}
         >
           {suggestions.map((suggestion, index) => {
-            const { primary, region } = formatSuggestion(suggestion);
+            const { primary, region } = suggestion;
 
             return (
               <div
-                key={suggestion.place_id}
+                key={suggestion.key}
                 onMouseDown={(event) => {
                   event.preventDefault();
-                  flyToResult(suggestion);
+                  selectResult(suggestion);
                 }}
                 onMouseEnter={() => setSelectedIndex(index)}
                 style={{
