@@ -161,7 +161,7 @@ const ActionItem = ({ action, onDelete }) => {
     );
 };
 
-const SuggestionCard = ({ topic, onQueue, queuedIds }) => (
+const SuggestionCard = ({ topic, onSelect, selectedId }) => (
     <div
     style={{
         background: "rgba(255,255,255,0.04)",
@@ -181,26 +181,25 @@ const SuggestionCard = ({ topic, onQueue, queuedIds }) => (
     </div>
     <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
     {topic.actions.map((action) => {
-        const isQueued = queuedIds?.has(action.id);
+        const isSelected = selectedId === action.id;
         return (
             <button
             key={action.id}
             type="button"
-            disabled={isQueued}
-            onClick={() => onQueue(action)}
+            onClick={() => onSelect(action)}
             style={{
-                background: isQueued ? "rgba(34,197,94,0.12)" : "rgba(109,40,217,0.12)",
-                border: isQueued ? "1px solid rgba(74,222,128,0.35)" : "1px solid rgba(139,92,246,0.24)",
+                background: isSelected ? "rgba(34,197,94,0.12)" : "rgba(109,40,217,0.12)",
+                border: isSelected ? "1px solid rgba(74,222,128,0.35)" : "1px solid rgba(139,92,246,0.24)",
                 borderRadius: "10px",
                 color: "rgba(255,255,255,0.9)",
-                cursor: isQueued ? "default" : "pointer",
+                cursor: "pointer",
                 fontFamily: "sans-serif",
                 padding: "0.55rem 0.7rem",
                 textAlign: "left",
             }}
             >
             <div style={{ fontSize: "0.76rem", fontWeight: 700 }}>
-            {isQueued ? `✓ Queued — ${action.title}` : action.title}
+            {isSelected ? `✓ ${action.title}` : action.title}
             </div>
             <div style={{ color: "rgba(255,255,255,0.62)", fontSize: "0.74rem", lineHeight: "1.45", marginTop: "0.18rem" }}>
             {action.text}
@@ -220,7 +219,7 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
     const countryDisplayName = useCountryDisplayName(country);
     const [gameDate, setGameDate] = React.useState("the current date");
     const [suggestions, setSuggestions] = React.useState([]);
-    const [queuedSuggestionIds, setQueuedSuggestionIds] = React.useState(() => new Set());
+    const [selectedSuggestionId, setSelectedSuggestionId] = React.useState(null);
     const [hasRequestedSuggestions, setHasRequestedSuggestions] = React.useState(false);
     const [isSubmitting, setIsSubmitting] = React.useState(false);
     const [isImproving, setIsImproving] = React.useState(false);
@@ -332,17 +331,20 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
         await persistActions(actions.filter((_, actionIndex) => actionIndex !== index));
     };
 
-    const handleQueueSuggestion = async (action) => {
-        const queuedAction = normalizeSuggestionAction(action);
-        if (!queuedAction) {
+    const handleSelectSuggestion = (action) => {
+        const normalized = normalizeSuggestionAction(action);
+        const text = normalized ? buildActionDisplayText(normalized) : null;
+        if (!text) {
             // Malformed AI suggestion — say so instead of doing nothing.
-            console.warn("[actions] suggestion could not be queued (no usable text):", action);
+            console.warn("[actions] suggestion has no usable text:", action);
             return;
         }
 
-        await persistActions([...actions, queuedAction]);
-        // Visible click feedback: the suggestion button flips to "✓ Queued".
-        setQueuedSuggestionIds((previous) => new Set(previous).add(action.id));
+        // Fill the input, don't submit — the player still reviews/edits before
+        // sending, same as the "improve" button's setInputValue+focus pattern.
+        setInputValue(text);
+        setSelectedSuggestionId(action.id);
+        inputRef.current?.focus();
     };
 
     const refreshSuggestions = async () => {
@@ -355,7 +357,7 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
         try {
             const topics = await generateActionSuggestions({ force: true });
             setSuggestions(topics);
-            setQueuedSuggestionIds(new Set());
+            setSelectedSuggestionId(null);
         } catch (error) {
             console.error("Failed to generate suggestions:", error);
             setSuggestions([]);
@@ -528,7 +530,7 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
                 </p>
             )}
             {suggestions.map((topic) => (
-                <SuggestionCard key={topic.id} topic={topic} onQueue={handleQueueSuggestion} queuedIds={queuedSuggestionIds} />
+                <SuggestionCard key={topic.id} topic={topic} onSelect={handleSelectSuggestion} selectedId={selectedSuggestionId} />
             ))}
             </div>
         )}

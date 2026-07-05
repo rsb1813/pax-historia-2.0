@@ -71,7 +71,7 @@ Chats: \${CHATS_NON_CONSOLIDATED_ROUNDS}
 Return JSON only:
 {"topics":[{"title":"","description":"","actions":[{"title":"","text":"","kind":"action"}]}]}
 
-Make 4-7 topics, each with 2-4 concrete actions. Cover diplomacy, internal stability, military posture, economics, and one medium-term objective.`,
+Make 4-9 topics, each with 1-2 concrete actions. Cover diplomacy, internal stability, military posture, economics, and one medium-term objective.`,
   autoJumpForward: `You simulate the world between turns and stop at the first especially notable or player-relevant development.
 Player polity: \${PLAYER_POLITY}
 Origin date: \${ORIGIN_ROUND_DATE}
