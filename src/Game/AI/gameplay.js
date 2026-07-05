@@ -721,10 +721,9 @@ const fallbackNextSpeaker = ({ chat, excludedSpeaker }) => {
     return { nextSpeaker: mentionedSpeaker.name };
   }
 
-  const fallbackCountry =
-    normalizedChat.countries.find((country) => country.name !== excludedSpeaker) ??
-    normalizedChat.countries[0] ??
-    { name: "" };
+  const eligibleCountries = normalizedChat.countries.filter((country) => country.name !== excludedSpeaker);
+  const candidates = eligibleCountries.length > 0 ? eligibleCountries : normalizedChat.countries;
+  const fallbackCountry = candidates[Math.floor(Math.random() * candidates.length)] ?? { name: "" };
 
   return {
     nextSpeaker: fallbackCountry.name,
