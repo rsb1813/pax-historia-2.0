@@ -77,13 +77,6 @@ normalizeActionEntry({
     title: input,
 });
 
-const normalizeSuggestionAction = (action) =>
-normalizeActionEntry({
-    ...action,
-    source: "suggested",
-    status: "planned",
-});
-
 const ActionItem = ({ action, onDelete }) => {
     const [hovered, setHovered] = React.useState(false);
     const normalized = normalizeActionEntry(action);
@@ -332,8 +325,7 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
     };
 
     const handleSelectSuggestion = (action) => {
-        const normalized = normalizeSuggestionAction(action);
-        const text = normalized ? buildActionDisplayText(normalized) : null;
+        const text = buildActionDisplayText(action);
         if (!text) {
             // Malformed AI suggestion — say so instead of doing nothing.
             console.warn("[actions] suggestion has no usable text:", action);
