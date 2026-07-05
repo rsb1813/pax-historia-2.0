@@ -154,7 +154,7 @@ const ActionItem = ({ action, onDelete }) => {
     );
 };
 
-const SuggestionCard = ({ topic, onSelect, selectedId }) => (
+const SuggestionCard = ({ topic, onSelect, selectedText }) => (
     <div
     style={{
         background: "rgba(255,255,255,0.04)",
@@ -174,7 +174,11 @@ const SuggestionCard = ({ topic, onSelect, selectedId }) => (
     </div>
     <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
     {topic.actions.map((action) => {
-        const isSelected = selectedId === action.id;
+        // Derived from the input's current text, not a stored id, so the
+        // checkmark tracks whatever's actually in the input — including
+        // after submit clears it or the player edits/improves it away.
+        const actionText = buildActionDisplayText(action);
+        const isSelected = Boolean(selectedText) && actionText === selectedText;
         return (
             <button
             key={action.id}
@@ -212,7 +216,6 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
     const countryDisplayName = useCountryDisplayName(country);
     const [gameDate, setGameDate] = React.useState("the current date");
     const [suggestions, setSuggestions] = React.useState([]);
-    const [selectedSuggestionId, setSelectedSuggestionId] = React.useState(null);
     const [hasRequestedSuggestions, setHasRequestedSuggestions] = React.useState(false);
     const [isSubmitting, setIsSubmitting] = React.useState(false);
     const [isImproving, setIsImproving] = React.useState(false);
@@ -335,7 +338,6 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
         // Fill the input, don't submit — the player still reviews/edits before
         // sending, same as the "improve" button's setInputValue+focus pattern.
         setInputValue(text);
-        setSelectedSuggestionId(action.id);
         inputRef.current?.focus();
     };
 
@@ -349,7 +351,6 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
         try {
             const topics = await generateActionSuggestions({ force: true });
             setSuggestions(topics);
-            setSelectedSuggestionId(null);
         } catch (error) {
             console.error("Failed to generate suggestions:", error);
             setSuggestions([]);
@@ -522,7 +523,7 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
                 </p>
             )}
             {suggestions.map((topic) => (
-                <SuggestionCard key={topic.id} topic={topic} onSelect={handleSelectSuggestion} selectedId={selectedSuggestionId} />
+                <SuggestionCard key={topic.id} topic={topic} onSelect={handleSelectSuggestion} selectedText={inputValue} />
             ))}
             </div>
         )}
