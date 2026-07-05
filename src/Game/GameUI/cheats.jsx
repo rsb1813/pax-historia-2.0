@@ -92,6 +92,15 @@ const rgbToHex = (rgb) =>
         ? `#${rgb.map((part) => Math.max(0, Math.min(255, Math.round(part))).toString(16).padStart(2, "0")).join("")}`
         : "#888888";
 
+// Blank input = leave the stat unchanged (undefined, not null — null would mean
+// "explicitly clear it", which this tool doesn't offer).
+const parseStatInput = (raw) => {
+    const trimmed = String(raw ?? "").trim();
+    if (!trimmed) return undefined;
+    const num = Number(trimmed);
+    return Number.isFinite(num) ? Math.max(0, Math.min(100, Math.round(num))) : undefined;
+};
+
 // Every country the game knows: the base map list, plus era polities from the
 // world (which win the name when both exist).
 const loadPolities = async () => {
@@ -492,6 +501,9 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                 ? ((fields.code ?? "").trim().toUpperCase() || name)
                 : (target || "").trim();
             const colorHex = (fields.color ?? "").trim();
+            const stability = parseStatInput(fields.stability);
+            const militaryStrength = parseStatInput(fields.militaryStrength);
+            const economyIndex = parseStatInput(fields.economyIndex);
             if (!code) throw new Error(adding ? "Give the country a name." : "Pick a country first.");
             const world = await readWorldState({ force: true });
             const existing = world.polityOverrides?.[code] ?? {};
@@ -500,6 +512,9 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
                 code,
                 name: name || existing.name || code,
                 ...(hexToRgb(colorHex) ? { color: colorHex.startsWith("#") ? colorHex : `#${colorHex}` } : null),
+                ...(stability !== undefined ? { stability } : null),
+                ...(militaryStrength !== undefined ? { militaryStrength } : null),
+                ...(economyIndex !== undefined ? { economyIndex } : null),
             };
             await writeWorldState({
                 ...world,
@@ -542,6 +557,15 @@ const ToolView = ({ tool, header, busy, status, game, polities, refresh, runBusy
             onChange={(event) => setFields({ ...fields, color: event.target.value })}
             style={{ background: "none", border: "none", cursor: "pointer", height: "2.1rem", padding: 0, width: "2.6rem" }}
             />
+            </div>
+            <label style={labelStyle}>Stability (0–100, optional)</label>
+            <input style={inputStyle} type="number" min={0} max={100} value={fields.stability ?? ""} onChange={(event) => setFields({ ...fields, stability: event.target.value })} placeholder="Leave blank to let the AI decide" />
+            <label style={labelStyle}>Military strength (0–100, optional)</label>
+            <input style={inputStyle} type="number" min={0} max={100} value={fields.militaryStrength ?? ""} onChange={(event) => setFields({ ...fields, militaryStrength: event.target.value })} placeholder="Leave blank to let the AI decide" />
+            <label style={labelStyle}>Economy index (0–100, optional)</label>
+            <input style={inputStyle} type="number" min={0} max={100} value={fields.economyIndex ?? ""} onChange={(event) => setFields({ ...fields, economyIndex: event.target.value })} placeholder="Leave blank to let the AI decide" />
+            <div style={{ color: "rgba(255,255,255,0.45)", fontSize: "0.72rem", marginTop: "0.4rem" }}>
+            Stats are fed to the AI as authoritative ground truth for the Stats tab and intelligence briefings — they may take a refresh to show up, and aren't guaranteed to appear verbatim in AI-written text.
             </div>
             <button type="button" disabled={busy} onClick={applyCountry} style={{ ...primaryButtonStyle, marginTop: "0.7rem", width: "100%" }}>
             {adding ? "Create country" : "Save changes"}

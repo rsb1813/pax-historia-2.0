@@ -612,6 +612,14 @@ export const normalizeEvents = (events) => {
   return [];
 };
 
+// Cheat-editable 0-100 stat sliders (stability/military/economy). `null` means
+// "no override" — the AI stat sheet/briefing is free to invent its own figure.
+const clampPolityStat = (value) => {
+  if (value === null || value === undefined || value === "") return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.max(0, Math.min(100, Math.round(num))) : null;
+};
+
 const normalizePolityOverride = (key, value) => {
   if (!value || typeof value !== "object") {
     return null;
@@ -626,8 +634,11 @@ const normalizePolityOverride = (key, value) => {
     aliases: normalizeActionParticipants(value.aliases || value.additionalNames),
     code,
     color: normalizeOptionalString(value.color),
+    economyIndex: clampPolityStat(value.economyIndex),
+    militaryStrength: clampPolityStat(value.militaryStrength),
     name: normalizeOptionalString(value.name || value.label),
     note: normalizeOptionalString(value.note),
+    stability: clampPolityStat(value.stability),
   };
 };
 

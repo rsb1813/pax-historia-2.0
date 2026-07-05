@@ -1021,6 +1021,14 @@ const buildTargetDossier = async (bundle, code) => {
       }`,
     );
     if (polity.note) lines.push(`Notes: ${polity.note}`);
+
+    const statParts = [];
+    if (Number.isFinite(polity.stability)) statParts.push(`stability ${polity.stability}/100`);
+    if (Number.isFinite(polity.militaryStrength)) statParts.push(`military strength ${polity.militaryStrength}/100`);
+    if (Number.isFinite(polity.economyIndex)) statParts.push(`economy index ${polity.economyIndex}/100`);
+    if (statParts.length > 0) {
+      lines.push(`Recorded stats (authoritative — use these, don't invent contradicting figures): ${statParts.join(", ")}.`);
+    }
   }
 
   const overrides = Object.entries(world.regionOwnershipOverrides ?? {});
